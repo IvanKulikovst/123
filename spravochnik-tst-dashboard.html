@@ -1106,6 +1106,20 @@ body[data-ws="catalog"] #fleetBell         { display: none !important; }
 .f-td-muted { color: var(--text-secondary); }
 .f-td-nowrap { white-space: nowrap; }
 .f-row-actions { display: flex; gap: 4px; justify-content: flex-end; }
+.f-table input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+.f-table tbody tr.is-selected { background: var(--accent-bg); }
+
+/* ---------- Панель массовых операций (парк техники) ---------- */
+.f-bulkbar {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 10px 16px;
+  border-radius: var(--radius);
+  background: var(--accent-bg-strong);
+  border: 1px solid var(--border-strong);
+  margin-bottom: 14px;
+  font-size: 13px; font-weight: 550;
+}
+.f-bulkbar-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; }
 .f-icon-btn {
   width: 30px; height: 30px; border-radius: 7px;
   display: grid; place-items: center;
@@ -1198,6 +1212,12 @@ body[data-ws="catalog"] #fleetBell         { display: none !important; }
 .f-vcard.lvl-urgent::before  { background: var(--st-urgent); }
 .f-vcard.lvl-overdue::before { background: var(--st-overdue); }
 .f-vcard.lvl-none::before, .f-vcard.lvl-retired::before { background: var(--st-none); }
+.f-vcard { padding-left: 40px; }
+.f-vcard.is-selected { box-shadow: 0 0 0 2px var(--accent) inset; }
+.f-vcard-check {
+  position: absolute; top: 16px; left: 16px;
+  width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer;
+}
 .f-vcard-head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
 .f-vcard-name { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
 .f-vcard-model { font-size: 12.5px; color: var(--text-secondary); margin-top: 2px; }
@@ -5380,7 +5400,8 @@ const ui = {
   park: {
     q: '', unit: '', responsible: '', status: '', level: '',
     from: '', to: '', mode: 'table',
-    sort: { key: 'name', dir: 'asc' }
+    sort: { key: 'name', dir: 'asc' },
+    selected: new Set()   // id-ы отмеченных чекбоксами единиц техники (массовые операции)
   },
   dash:   { sort: { key: 'pct', dir: 'asc' } },
   report: { key: 'vehicles', from: '', to: '', unit: '' }
@@ -5742,6 +5763,7 @@ function renderPark() {
 
 function renderParkResults(rows) {
   rows = rows || parkRows();
+  const sel = ui.park.selected;
 
   if (!DB.vehicles.length) {
     return emptyState(FI.truck(28), 'Техника не зарегистрирована',
@@ -5754,9 +5776,23 @@ function renderParkResults(rows) {
       '<button type="button" class="f-btn" data-act="reset-filters">Сбросить фильтры</button>');
   }
 
+  // Убираем из выбора id, которых больше нет среди видимых по фильтрам записей — только визуально не мешает,
+  // сам Set чистится по факту удаления в removeVehicle()
+  const bulkBar = sel.size ? `
+    <div class="f-bulkbar">
+      <span class="f-bulkbar-count">Выбрано: ${sel.size}</span>
+      <div class="f-bulkbar-actions">
+        <button type="button" class="f-btn f-btn-sm" data-act="bulk-status">${FI.edit(14)}<span>Статус</span></button>
+        <button type="button" class="f-btn f-btn-sm" data-act="bulk-interval">${FI.gauge(14)}<span>Интервал ТО</span></button>
+        <button type="button" class="f-btn f-btn-sm f-btn-danger" data-act="bulk-delete">${FI.trash(14)}<span>Удалить</span></button>
+        <button type="button" class="f-btn f-btn-ghost f-btn-sm" data-act="clear-selection">Снять выделение</button>
+      </div>
+    </div>` : '';
+
   if (ui.park.mode === 'cards') {
-    return `<div class="f-cards">${rows.map(({ v, st }) => `
-      <div class="f-vcard lvl-${st.level}" data-act="open-vehicle" data-id="${v.id}">
+    return bulkBar + `<div class="f-cards">${rows.map(({ v, st }) => `
+      <div class="f-vcard lvl-${st.level} ${sel.has(v.id) ? 'is-selected' : ''}" data-act="open-vehicle" data-id="${v.id}">
+        <input type="checkbox" class="f-vcard-check" data-act="row-select" data-id="${v.id}" title="Выбрать" ${sel.has(v.id) ? 'checked' : ''}>
         <div class="f-vcard-head">
           <div style="min-width:0">
             <div class="f-vcard-name">${esc(v.name)}</div>
@@ -5777,10 +5813,13 @@ function renderParkResults(rows) {
       </div>`).join('')}</div>`;
   }
 
-  return `
+  const allSelected = rows.length > 0 && rows.every(({ v }) => sel.has(v.id));
+
+  return bulkBar + `
     <div class="f-table-wrap"><div class="f-table-scroll">
       <table class="f-table">
         <thead><tr>
+          <th style="width:34px"><input type="checkbox" data-act="select-all" ${allSelected ? 'checked' : ''} title="Выбрать всё показанное"></th>
           <th style="width:34px"></th>
           ${th('Наименование', 'name', 'park')}
           ${th('Гос. номер', 'regNumber', 'park')}
@@ -5794,7 +5833,8 @@ function renderParkResults(rows) {
         </tr></thead>
         <tbody>
           ${rows.map(({ v, st }) => `
-            <tr class="is-clickable" data-act="open-vehicle" data-id="${v.id}">
+            <tr class="is-clickable ${sel.has(v.id) ? 'is-selected' : ''}" data-act="open-vehicle" data-id="${v.id}">
+              <td><input type="checkbox" data-act="row-select" data-id="${v.id}" ${sel.has(v.id) ? 'checked' : ''}></td>
               <td><span class="f-dot f-lvl-${st.level}" title="${esc(LEVELS[st.level].label)}"></span></td>
               <td class="f-td-strong">${esc(v.name)}<div class="f-td-muted" style="font-size:12px;font-weight:400">${esc(v.brand || '')}</div></td>
               <td>${v.regNumber ? `<span class="f-plate">${esc(v.regNumber)}</span>` : '<span class="f-td-muted">—</span>'}</td>
@@ -6100,6 +6140,7 @@ function removeVehicle(v) {
   DB.maint = DB.maint.filter(m => m.vehicleId !== v.id);
   DB.hours = DB.hours.filter(h => h.vehicleId !== v.id);
   DB.vehicles = DB.vehicles.filter(x => x.id !== v.id);
+  ui.park.selected.delete(v.id);
   saveDB();
 }
 
@@ -6725,6 +6766,101 @@ function vehicleModal(vehicle) {
 }
 
 /* =========================================================================
+   20a. МАССОВЫЕ ОПЕРАЦИИ НАД ВЫБРАННОЙ ТЕХНИКОЙ
+   ========================================================================= */
+
+/* Массовая смена статуса */
+function bulkStatusModal(ids) {
+  const m = openModal(`
+    <div class="f-modal-head">
+      <div>
+        <div class="f-modal-title">Изменить статус</div>
+        <div class="f-modal-sub">Будет применено к ${ids.length} ед. техники</div>
+      </div>
+      <button type="button" class="f-modal-close" data-close aria-label="Закрыть">${FI.x(16)}</button>
+    </div>
+    <div class="f-modal-body">
+      <div class="f-form-grid">
+        <div class="f-span2"><label class="f-fld-label" for="bulkStatus">Новый статус</label>
+          <select id="bulkStatus" class="f-select">${options(STATUSES, STATUSES[0])}</select></div>
+      </div>
+    </div>
+    <div class="f-modal-foot">
+      <button type="button" class="f-btn" data-close>Отмена</button>
+      <button type="button" class="f-btn f-btn-primary" id="bulkStatusSave">${FI.save(15)}<span>Применить</span></button>
+    </div>`, { narrow: true });
+
+  m.root.querySelector('#bulkStatusSave').addEventListener('click', () => {
+    const status = m.root.querySelector('#bulkStatus').value;
+    let count = 0;
+    ids.forEach(id => {
+      const v = getVehicle(id);
+      if (v) { v.status = status; v.updatedAt = new Date().toISOString(); count++; }
+    });
+    saveDB();
+    m.close();
+    ui.park.selected.clear();
+    toast('success', 'Статус изменён', `Обновлено ${count} ед. техники.`);
+    rerender();
+  });
+}
+
+/* Массовая смена интервала планового ТО */
+function bulkIntervalModal(ids) {
+  const m = openModal(`
+    <div class="f-modal-head">
+      <div>
+        <div class="f-modal-title">Изменить интервал ТО</div>
+        <div class="f-modal-sub">Будет применено к ${ids.length} ед. техники</div>
+      </div>
+      <button type="button" class="f-modal-close" data-close aria-label="Закрыть">${FI.x(16)}</button>
+    </div>
+    <div class="f-modal-body">
+      <div class="f-form-grid">
+        <div>
+          <label class="f-check" style="margin-bottom:8px">
+            <input type="checkbox" id="bulkByHours" checked> По моточасам
+          </label>
+          <input id="bulkHoursInt" class="f-input" type="number" min="1" step="1" value="${DB.settings.defaultHours}">
+        </div>
+        <div>
+          <label class="f-check" style="margin-bottom:8px">
+            <input type="checkbox" id="bulkByDate" checked> По календарной дате
+          </label>
+          <input id="bulkDaysInt" class="f-input" type="number" min="1" step="1" value="${DB.settings.defaultDays}">
+        </div>
+      </div>
+      <div class="f-hint" style="margin-top:8px">Если включены оба критерия, ТО назначается по тому, который наступит раньше.</div>
+    </div>
+    <div class="f-modal-foot">
+      <button type="button" class="f-btn" data-close>Отмена</button>
+      <button type="button" class="f-btn f-btn-primary" id="bulkIntervalSave">${FI.save(15)}<span>Применить</span></button>
+    </div>`, { narrow: true });
+
+  const R = m.root;
+  const q = id => R.querySelector('#' + id);
+  q('bulkByHours').addEventListener('change', e => { q('bulkHoursInt').disabled = !e.target.checked; });
+  q('bulkByDate').addEventListener('change',  e => { q('bulkDaysInt').disabled  = !e.target.checked; });
+
+  q('bulkIntervalSave').addEventListener('click', () => {
+    const byHours = q('bulkByHours').checked;
+    const byDate  = q('bulkByDate').checked;
+    const hours = Math.max(1, parseInt(q('bulkHoursInt').value, 10) || DB.settings.defaultHours);
+    const days  = Math.max(1, parseInt(q('bulkDaysInt').value, 10)  || DB.settings.defaultDays);
+    let count = 0;
+    ids.forEach(id => {
+      const v = getVehicle(id);
+      if (v) { v.interval = { byHours, hours, byDate, days }; count++; }
+    });
+    saveDB();
+    m.close();
+    ui.park.selected.clear();
+    toast('success', 'Интервал обновлён', `Обновлено ${count} ед. техники.`);
+    rerender();
+  });
+}
+
+/* =========================================================================
    21. ФОРМА ЗАПИСИ ТЕХНИЧЕСКОГО ОБСЛУЖИВАНИЯ (с вложениями)
    ========================================================================= */
 function maintModal(vehicleId, maint) {
@@ -7273,6 +7409,46 @@ function onFleetClick(e) {
       Object.assign(ui.park, { q: '', unit: '', responsible: '', status: '', level: '', from: '', to: '' });
       renderView();
       break;
+
+    case 'row-select':
+      if (node.checked) ui.park.selected.add(id); else ui.park.selected.delete(id);
+      refreshPark();
+      break;
+
+    case 'select-all': {
+      const visible = parkRows();
+      if (node.checked) visible.forEach(({ v }) => ui.park.selected.add(v.id));
+      else visible.forEach(({ v }) => ui.park.selected.delete(v.id));
+      refreshPark();
+      break;
+    }
+
+    case 'clear-selection':
+      ui.park.selected.clear();
+      refreshPark();
+      break;
+
+    case 'bulk-status':
+      if (ui.park.selected.size) bulkStatusModal(Array.from(ui.park.selected));
+      break;
+
+    case 'bulk-interval':
+      if (ui.park.selected.size) bulkIntervalModal(Array.from(ui.park.selected));
+      break;
+
+    case 'bulk-delete': {
+      const ids = Array.from(ui.park.selected);
+      if (!ids.length) break;
+      confirmDialog('Удалить выбранную технику?',
+        `Будет удалено ${ids.length} ед. техники со всеми записями ТО, историей моточасов и вложениями. Действие необратимо.`)
+        .then(ok => {
+          if (!ok) return;
+          ids.forEach(vid => { const v = getVehicle(vid); if (v) removeVehicle(v); });
+          toast('success', 'Техника удалена', `Удалено ${ids.length} ед. техники.`);
+          rerender();
+        });
+      break;
+    }
 
     case 'report':
       ui.report.key = node.dataset.key;
