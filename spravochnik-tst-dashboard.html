@@ -7401,6 +7401,10 @@ if (document.readyState === 'loading') {
   function go(ws){window.__lastWorkspace=ws;setOverview(false); if(ws==='fleet')document.getElementById('wsFleet').click(); else document.getElementById('wsCatalog').click();}
   function initOverview(){
     document.getElementById('wsOverview').addEventListener('click',()=>setOverview(true));
+    // Прямой клик по вкладкам «Справочник»/«Учёт» тоже должен скрывать слой обзора —
+    // иначе после «Обзор» эти вкладки визуально не переключаются (оверлей остаётся поверх).
+    document.getElementById('wsCatalog').addEventListener('click',()=>{window.__lastWorkspace='catalog';setOverview(false);});
+    document.getElementById('wsFleet').addEventListener('click',()=>{window.__lastWorkspace='fleet';setOverview(false);});
     document.querySelectorAll('[data-overview-go]').forEach(b=>b.addEventListener('click',()=>go(b.dataset.overviewGo)));
     document.getElementById('overviewDate').textContent=new Intl.DateTimeFormat('ru-RU',{dateStyle:'long'}).format(new Date());
   }
