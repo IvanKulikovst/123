@@ -1303,7 +1303,9 @@ body[data-ws="catalog"] #fleetBell         { display: none !important; }
   background: rgba(0,0,0,.42);
   backdrop-filter: blur(3px);
   -webkit-backdrop-filter: blur(3px);
-  z-index: 200;
+  /* Выше всплывающих сообщений (z-index: 300): открытая форма — активная
+     задача пользователя и не должна перекрываться уведомлениями */
+  z-index: 400;
   display: flex; align-items: center; justify-content: center;
   padding: 20px;
   opacity: 0;
@@ -1383,7 +1385,9 @@ body[data-ws="catalog"] #fleetBell         { display: none !important; }
 /* ---------- Всплывающие уведомления ---------- */
 .f-toasts {
   position: fixed;
-  top: calc(var(--header-height) + 12px);
+  /* Ниже панели навигации модуля: всплывающие сообщения перехватывают клики
+     (pointer-events: auto), поэтому не должны накрывать её кнопки */
+  top: calc(var(--header-height) + 64px);
   right: 16px;
   z-index: 300;
   display: flex; flex-direction: column; gap: 8px;
@@ -6113,6 +6117,12 @@ function fmtSize(bytes) {
 }
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
+/* Разумный верхний предел показаний счётчика: 10 млн мото·ч (≈1100 лет
+   непрерывной работы). Защищает расчёты и вёрстку таблиц от значений вида
+   1e21, которые браузер принимает в поле type="number". */
+const MAX_HOURS = 10000000;
+const validHours = n => isFinite(n) && n >= 0 && n <= MAX_HOURS;
+
 /* Склонение существительных: plural(5,'день','дня','дней') → 'дней' */
 function plural(n, one, few, many) {
   const a = Math.abs(n) % 100, b = a % 10;
@@ -6259,11 +6269,22 @@ function tripsOf(vehicleId) {
                     (b.createdAt || '').localeCompare(a.createdAt || ''));
 }
 
-/* Годовая наработка техники: сумма приростов моточасов за календарный год */
+/* Годовая наработка техники: сумма приростов показаний счётчика за календарный
+   год. Прирост считается относительно предыдущего показания (в том числе
+   сделанного в прошлом году), поэтому самое первое показание единицы техники
+   в расход не попадает — это база отсчёта, а не наработка. */
 function hoursInYear(vehicleId, year) {
-  return hoursOf(vehicleId)
-    .filter(h => h.date && h.date.slice(0, 4) === String(year) && h.delta > 0)
-    .reduce((s, h) => s + Number(h.delta || 0), 0);
+  const asc = hoursOf(vehicleId).slice().reverse();   // hoursOf отдаёт от новых к старым
+  let prev = null, sum = 0;
+  asc.forEach(h => {
+    const val = Number(h.value);
+    if (!isFinite(val)) return;
+    if (prev != null && h.date && h.date.slice(0, 4) === String(year)) {
+      sum += Math.max(0, val - prev);                 // отрицательные скачки (замена счётчика) не учитываем
+    }
+    prev = val;
+  });
+  return sum;
 }
 
 /* Последнее ТО, сбрасывающее межсервисный интервал (ЕО и ремонты не в счёт) */
@@ -7393,6 +7414,8 @@ function syncTripHours(t) {
               source: 'trip', createdAt: new Date().toISOString() };
     DB.hours.push(entry);
   }
+  // При смене техники в путевом листе показание должно уйти вместе с ним
+  entry.vehicleId = t.vehicleId;
   entry.date  = t.date;
   entry.value = Number(t.endHours || 0);
   entry.note  = 'Путевой лист' + (t.driver ? ' · ' + t.driver : '') + (t.purpose ? ' — ' + t.purpose : '');
@@ -7410,8 +7433,11 @@ function removeVehicle(v) {
           .forEach(m => (m.docs || []).forEach(d => fileDel(d.id)));
   DB.maint = DB.maint.filter(m => m.vehicleId !== v.id);
   DB.hours = DB.hours.filter(h => h.vehicleId !== v.id);
+  DB.trips = DB.trips.filter(t => t.vehicleId !== v.id);
   DB.vehicles = DB.vehicles.filter(x => x.id !== v.id);
   ui.park.selected.delete(v.id);
+  // Фильтр путевых листов не должен указывать на удалённую технику
+  if (ui.trips.vehicle === v.id) ui.trips.vehicle = '';
   saveDB();
 }
 
@@ -7576,7 +7602,16 @@ function renderTripResults(rows) {
       `<button type="button" class="f-btn f-btn-primary" data-act="add-trip">Добавить путевой лист</button>`) + `</div>`;
   }
 
+  // Журнал может накопить тысячи записей: показываем страницу и подсказываем
+  // сузить период, иначе отрисовка всей таблицы заметно тормозит интерфейс
+  const LIMIT = 200;
+  const shown = rows.slice(0, LIMIT);
+  // Поиск техники по id через Map — линейный find на каждую строку давал
+  // квадратичную сложность на больших журналах
+  const vmap = new Map(DB.vehicles.map(v => [v.id, v]));
+
   return `
+    ${rows.length > LIMIT ? `<div class="f-hint" style="margin-bottom:10px">Найдено записей: ${rows.length}. Показаны первые ${LIMIT} — уточните технику или период, чтобы увидеть остальные.</div>` : ''}
     <div class="f-table-wrap"><div class="f-table-scroll">
       <table class="f-table">
         <thead><tr>
@@ -7585,8 +7620,8 @@ function renderTripResults(rows) {
           <th class="f-td-num">Наработка за выход</th><th style="width:80px"></th>
         </tr></thead>
         <tbody>
-          ${rows.map(t => {
-            const v = getVehicle(t.vehicleId);
+          ${shown.map(t => {
+            const v = vmap.get(t.vehicleId);
             const dist = (t.endHours != null && t.startHours != null) ? Number(t.endHours) - Number(t.startHours) : null;
             return `
             <tr>
@@ -7614,6 +7649,8 @@ function refreshTrips() {
 }
 
 function bindTripFilters() {
+  // Фильтр мог остаться от техники, удалённой или отсутствующей в копии
+  if (ui.trips.vehicle && !getVehicle(ui.trips.vehicle)) ui.trips.vehicle = '';
   const sel = el('tripVehicle');
   if (sel) {
     sel.innerHTML = `<option value="">Все</option>` +
@@ -7651,14 +7688,15 @@ function tripModal(trip) {
         <div><label class="f-fld-label" for="tVeh">Техника *</label>
           <select id="tVeh" class="f-select">${active.map(v => `<option value="${esc(v.id)}"${v.id === t.vehicleId ? ' selected' : ''}>${esc(v.name)}${v.regNumber ? ' · ' + esc(v.regNumber) : ''}</option>`).join('')}</select></div>
         <div><label class="f-fld-label" for="tDate">Дата выхода *</label>
-          <input id="tDate" class="f-input" type="date" value="${esc(t.date)}" max="${todayISO()}"></div>
+          <input id="tDate" class="f-input" type="date" value="${esc(t.date)}" max="${todayISO()}">
+          <div class="f-error" id="errTDate">Укажите корректную дату (не позднее сегодняшней)</div></div>
         <div><label class="f-fld-label" for="tDriver">Водитель (расчёт)</label>
           <input id="tDriver" class="f-input" value="${esc(t.driver)}" placeholder="ефрейтор Сидоров С.С."></div>
         <div><label class="f-fld-label" for="tPurpose">Маршрут / задача</label>
           <input id="tPurpose" class="f-input" value="${esc(t.purpose)}" placeholder="Подвоз горячей пищи на полигон"></div>
         <div><label class="f-fld-label" for="tStart">Показание на начало выхода *</label>
           <input id="tStart" class="f-input" type="number" min="0" step="0.1" value="${t.startHours !== '' ? t.startHours : (vForStart ? Number(vForStart.currentHours || 0) : 0)}">
-          <div class="f-error" id="errStart">Укажите неотрицательное значение</div></div>
+          <div class="f-error" id="errStart">Укажите значение от 0 до 10 000 000 мото·ч</div></div>
         <div><label class="f-fld-label" for="tEnd">Показание на конец выхода *</label>
           <input id="tEnd" class="f-input" type="number" min="0" step="0.1" value="${t.endHours}">
           <div class="f-error" id="errEnd">Должно быть не меньше показания на начало</div></div>
@@ -7692,15 +7730,19 @@ function tripModal(trip) {
       q(errId).classList.toggle('is-visible', cond);
       if (cond) bad = true;
     };
-    setErr('tStart', 'errStart', isNaN(start) || start < 0);
-    setErr('tEnd', 'errEnd', isNaN(end) || end < start);
-    if (!vehicleId || !date) bad = true;
+    setErr('tStart', 'errStart', !validHours(start));
+    setErr('tEnd', 'errEnd', !validHours(end) || end < start);
+    setErr('tDate', 'errTDate', !date || date > todayISO());
+    if (!vehicleId) { toast('warning', 'Не выбрана техника', 'Укажите единицу техники для путевого листа.'); bad = true; }
     if (bad) return;
 
     const payload = {
       vehicleId, date, driver: q('tDriver').value.trim(), purpose: q('tPurpose').value.trim(),
       startHours: start, endHours: end, note: q('tNote').value.trim()
     };
+
+    // При редактировании технику могли сменить — пересчитать нужно обе карточки
+    const prevVehicleId = isNew ? null : trip.vehicleId;
 
     if (isNew) {
       const nt = Object.assign({ id: uid('t'), createdAt: new Date().toISOString() }, payload);
@@ -7711,6 +7753,7 @@ function tripModal(trip) {
       syncTripHours(trip);
     }
 
+    if (prevVehicleId && prevVehicleId !== vehicleId) recomputeHours(prevVehicleId);
     recomputeHours(vehicleId);
     saveDB();
     m.close();
@@ -7769,10 +7812,20 @@ function toNeedByGroup() {
     r.count++;
     r.Lgod += Number(v.annualPlanHours || 0);
   });
+  // Периодичность — делитель в формулах (5)-(7): защищаемся от нуля и мусора
+  // в настройках (например, после восстановления из повреждённой копии).
+  const period = (val, fallback) => {
+    const n = Number(val);
+    return (isFinite(n) && n > 0) ? n : fallback;
+  };
+  const pTO1 = period(s.periodTO1, DEFAULT_SETTINGS.periodTO1);
+  const pTO2 = period(s.periodTO2, DEFAULT_SETTINGS.periodTO2);
+  const pTR  = period(s.periodTR,  DEFAULT_SETTINGS.periodTR);
+
   return Array.from(map.values()).map(r => {
-    const nTO2 = Math.floor(r.Lgod / s.periodTO2);
-    const nTO1 = Math.max(0, Math.floor(r.Lgod / s.periodTO1) - nTO2);
-    const nTR  = Math.floor(r.Lgod / s.periodTR);
+    const nTO2 = Math.floor(r.Lgod / pTO2);
+    const nTO1 = Math.max(0, Math.floor(r.Lgod / pTO1) - nTO2);
+    const nTR  = Math.floor(r.Lgod / pTR);
     const tTO1 = nTO1 * Number(s.laborNorms['ТО-1'] || 0);
     const tTO2 = nTO2 * Number(s.laborNorms['ТО-2'] || 0);
     const tTR  = nTR  * Number(s.laborNorms['ТР']   || 0);
@@ -7887,12 +7940,13 @@ function renderPlanKtg() {
 }
 
 function renderPlanResource() {
-  const rows = resourceSummary().filter(r => r.normSet);
-  const skipped = resourceSummary().length - rows.length;
+  const all = resourceSummary();
+  const rows = all.filter(r => r.normSet);
+  const skipped = all.length - rows.length;
   return `
     <div class="f-panel">
       <div class="f-panel-title">Наличие моторесурса на ${new Date().getFullYear()} год</div>
-      <div class="f-hint" style="margin-bottom:12px">Резерв — 5% от годовой нормы (на инспектирование и итоговые проверки). Разрешаемый расход = норма − резерв.</div>
+      <div class="f-hint" style="margin-bottom:12px">Резерв — 5% от годовой нормы (на инспектирование и итоговые проверки). Разрешаемый расход = норма − резерв. Все значения в таблице — в мото·ч.</div>
       ${!rows.length ? emptyState(FI.gauge(28), 'Нет данных для расчёта',
         'Укажите годовую норму расхода ресурса в карточках техники, чтобы увидеть расчёт наличия моторесурса.') : `
       <div class="f-table-wrap"><div class="f-table-scroll">
@@ -8066,38 +8120,54 @@ function renderPlanEconomy() {
 }
 
 function bindPlanningInputs() {
-  const num = (id, apply) => {
+  /* min/max — те же границы, что объявлены у полей в разметке. Периодичность
+     не может быть нулевой: на неё выполняется деление в формулах (5)-(7). */
+  const num = (id, apply, min, max) => {
     const n = el(id);
     if (!n) return;
+    const lo = min == null ? 0 : min;
+    const hi = max == null ? 1e9 : max;
     n.addEventListener('change', () => {
       const v = parseFloat(String(n.value).replace(',', '.'));
-      if (isNaN(v) || v < 0) { renderView(); return; }
+      if (isNaN(v) || v < lo || v > hi) {
+        toast('warning', 'Некорректное значение', `Допустимый диапазон: от ${fmtNum(lo)} до ${fmtNum(hi)}.`);
+        refreshPlanTab();
+        bindPlanningInputs();
+        return;
+      }
       apply(v);
       saveDB();
       toast('success', 'Параметр сохранён', '');
       refreshPlanTab();
+      bindPlanningInputs();
     });
   };
-  num('ruSpecialists', v => DB.settings.repairUnit.specialists = v);
-  num('ruWorkDays',    v => DB.settings.repairUnit.workDaysMonth = v);
-  num('ruHoursDay',    v => DB.settings.repairUnit.hoursPerDay = v);
-  num('ruNonProd',     v => DB.settings.repairUnit.nonProdPct = v);
-  num('econCost',      v => DB.settings.normHourCost = v);
-  num('perTO1',        v => DB.settings.periodTO1 = v);
-  num('perTO2',        v => DB.settings.periodTO2 = v);
-  num('perTR',         v => DB.settings.periodTR = v);
-  num('laborTO1',      v => DB.settings.laborNorms['ТО-1'] = v);
-  num('laborTO2',      v => DB.settings.laborNorms['ТО-2'] = v);
-  num('laborTR',       v => DB.settings.laborNorms['ТР'] = v);
+  num('ruSpecialists', v => DB.settings.repairUnit.specialists = v, 0, 10000);
+  num('ruWorkDays',    v => DB.settings.repairUnit.workDaysMonth = v, 1, 31);
+  num('ruHoursDay',    v => DB.settings.repairUnit.hoursPerDay = v, 1, 24);
+  num('ruNonProd',     v => DB.settings.repairUnit.nonProdPct = v, 0, 100);
+  num('econCost',      v => DB.settings.normHourCost = v, 0, 1e7);
+  num('perTO1',        v => DB.settings.periodTO1 = v, 1);
+  num('perTO2',        v => DB.settings.periodTO2 = v, 1);
+  num('perTR',         v => DB.settings.periodTR = v, 1);
+  num('laborTO1',      v => DB.settings.laborNorms['ТО-1'] = v, 0, 100000);
+  num('laborTO2',      v => DB.settings.laborNorms['ТО-2'] = v, 0, 100000);
+  num('laborTR',       v => DB.settings.laborNorms['ТР'] = v, 0, 100000);
 
   document.querySelectorAll('[data-ktg-group]').forEach(n => {
     n.addEventListener('change', () => {
       const v = parseFloat(String(n.value).replace(',', '.'));
-      if (isNaN(v) || v <= 0 || v >= 1) { renderView(); return; }
+      if (isNaN(v) || v <= 0 || v >= 1) {
+        toast('warning', 'Некорректное значение', 'Норматив КТГ задаётся долей от 0,01 до 0,99.');
+        refreshPlanTab();
+        bindPlanningInputs();
+        return;
+      }
       DB.settings.ktgByGroup[n.dataset.ktgGroup] = v;
       saveDB();
       toast('success', 'Норматив КТГ сохранён', '');
       refreshPlanTab();
+      bindPlanningInputs();
     });
   });
 
@@ -8105,9 +8175,9 @@ function bindPlanningInputs() {
     const n = el(id);
     if (!n) return;
     n.addEventListener('change', () => {
-      ui.econ = ui.econ || { from: '', to: '' };
       ui.econ[prop] = n.value;
       refreshPlanTab();
+      bindPlanningInputs();
     });
   };
   econDate('econFrom', 'from');
@@ -8164,9 +8234,12 @@ function printAnnualPlan() {
 /* --- F. План-график ТО на месяц (формула 18: Дто = (Lто-1 − Lф)/Lсс) --- */
 function monthPlanRows() {
   const s = DB.settings;
+  const basePeriod = (isFinite(Number(s.periodTO1)) && Number(s.periodTO1) > 0)
+    ? Number(s.periodTO1) : DEFAULT_SETTINGS.periodTO1;
   return DB.vehicles.filter(v => v.status !== 'Списано').map(v => {
     const st = computeStatus(v);
-    const periodTO1 = (v.interval && v.interval.byHours && v.interval.hours) ? Number(v.interval.hours) : Number(s.periodTO1);
+    const periodTO1 = (v.interval && v.interval.byHours && Number(v.interval.hours) > 0)
+      ? Number(v.interval.hours) : basePeriod;
     const Lf = st.hoursSince;
     const dailyRun = Number(v.annualPlanHours || 0) > 0 ? Number(v.annualPlanHours) / 365 : null;
     let daysLeft = null, plannedDate = null;
@@ -8184,7 +8257,7 @@ function renderMonthPlanTable(rows) {
       <table class="f-table">
         <thead><tr>
           <th>Техника</th><th class="f-td-num">Периодичность ТО-1</th><th class="f-td-num">Наработка с ТО</th>
-          <th class="f-td-num">Среднесуточный пробег</th><th class="f-td-num">Дней до ТО</th><th>Расчётная дата ТО</th>
+          <th class="f-td-num">Среднесут. наработка</th><th class="f-td-num">Дней до ТО</th><th>Расчётная дата ТО</th>
         </tr></thead>
         <tbody>
           ${rows.map(r => `
@@ -8205,7 +8278,7 @@ function printMonthPlan() {
   const rows = monthPlanRows();
   const body = `<table>
     <thead><tr><th>Техника</th><th class="p-num">Периодичность ТО-1</th><th class="p-num">Наработка с ТО</th>
-    <th class="p-num">Среднесут. пробег</th><th class="p-num">Дней до ТО</th><th>Расчётная дата ТО</th></tr></thead>
+    <th class="p-num">Среднесут. наработка</th><th class="p-num">Дней до ТО</th><th>Расчётная дата ТО</th></tr></thead>
     <tbody>${rows.map(r => `<tr><td>${esc(r.v.name)}</td><td class="p-num">${fmtNum(r.periodTO1,0)}</td>
       <td class="p-num">${fmtNum(r.Lf,0)}</td><td class="p-num">${r.dailyRun != null ? fmtNum(r.dailyRun,1) : '—'}</td>
       <td class="p-num">${r.daysLeft != null ? r.daysLeft : '—'}</td><td>${r.plannedDate ? fmtDate(r.plannedDate) : '—'}</td></tr>`).join('')}
@@ -8280,7 +8353,7 @@ function renderDocuments() {
 
     <div class="f-panel">
       <div class="f-panel-title">План-график технического обслуживания и ремонта на месяц</div>
-      <p class="f-hint">Расчётная дата очередного ТО-1 — по формуле Д<sub>ТО</sub> = (L<sub>ТО-1</sub> − L<sub>ф</sub>)/L<sub>сс</sub>, где L<sub>сс</sub> — среднесуточный пробег (плановая годовая наработка / 365).</p>
+      <p class="f-hint">Расчётная дата очередного ТО-1 — по формуле Д<sub>ТО</sub> = (L<sub>ТО-1</sub> − L<sub>ф</sub>)/L<sub>сс</sub>, где L<sub>сс</sub> — среднесуточная наработка (плановая годовая наработка / 365). Показания — в мото·ч.</p>
       ${renderMonthPlanTable(monthRows)}
       <div style="margin-top:12px">
         <button type="button" class="f-btn f-btn-primary" data-act="print-month-plan">${FI.pdf(15)}<span>Сформировать и распечатать</span></button>
@@ -8788,7 +8861,7 @@ function vehicleModal(vehicle) {
         <div><label class="f-fld-label" for="vHours">Текущие моточасы</label>
           <input id="vHours" class="f-input" type="number" min="0" step="0.1" value="${Number(v.currentHours || 0)}">
           <div class="f-hint">${isNew ? 'Будет создана первая запись в истории моточасов' : 'Изменение добавит запись в историю'}</div>
-          <div class="f-error" id="errHours">Моточасы не могут быть отрицательными</div></div>
+          <div class="f-error" id="errHours">Укажите значение от 0 до 10 000 000 мото·ч</div></div>
 
         <fieldset class="f-fieldset f-span2">
           <legend>Планирование эксплуатации (методика ВАМТО, 2025)</legend>
@@ -8857,7 +8930,7 @@ function vehicleModal(vehicle) {
     };
     setErr('vName', 'errName', !name);
     setErr('vYear', 'errYear', !!year && (Number(year) < 1900 || Number(year) > new Date().getFullYear() + 1));
-    setErr('vHours', 'errHours', isNaN(hours) || hours < 0);
+    setErr('vHours', 'errHours', !validHours(hours));
     if (bad) return;
 
     const byHours = q('vByHours').checked;
@@ -9049,10 +9122,10 @@ function maintModal(vehicleId, maint) {
           <div class="f-hint">ЕО и ремонты не сбрасывают межсервисный интервал</div></div>
         <div><label class="f-fld-label" for="mDate">Дата проведения *</label>
           <input id="mDate" class="f-input" type="date" value="${esc(rec.date)}" max="${todayISO()}">
-          <div class="f-error" id="errDate">Укажите корректную дату</div></div>
+          <div class="f-error" id="errDate">Укажите корректную дату (не позднее сегодняшней)</div></div>
         <div><label class="f-fld-label" for="mHours">Текущие моточасы *</label>
           <input id="mHours" class="f-input" type="number" min="0" step="0.1" value="${Number(rec.hours || 0)}">
-          <div class="f-error" id="errMHours">Укажите неотрицательное значение</div></div>
+          <div class="f-error" id="errMHours">Укажите значение от 0 до 10 000 000 мото·ч</div></div>
         <div><label class="f-fld-label" for="mExec">Ответственный исполнитель</label>
           <input id="mExec" class="f-input" value="${esc(rec.executor)}"></div>
         <div><label class="f-fld-label" for="mUnit">Подразделение</label>
@@ -9125,7 +9198,13 @@ function maintModal(vehicleId, maint) {
   }));
   drop.addEventListener('drop', e => { if (e.dataTransfer && e.dataTransfer.files) addFiles(e.dataTransfer.files); });
 
+  // Сохранение асинхронное (запись вложений), поэтому повторные нажатия до его
+  // завершения блокируются — иначе одна и та же запись ТО создаётся несколько раз
+  let saving = false;
+
   q('mSave').addEventListener('click', async () => {
+    if (saving) return;
+
     const date = q('mDate').value;
     const hours = parseFloat(String(q('mHours').value).replace(',', '.'));
 
@@ -9135,9 +9214,12 @@ function maintModal(vehicleId, maint) {
       q(errId).classList.toggle('is-visible', cond);
       if (cond) bad = true;
     };
-    setErr('mDate', 'errDate', !date);
-    setErr('mHours', 'errMHours', isNaN(hours) || hours < 0);
+    setErr('mDate', 'errDate', !date || date > todayISO());
+    setErr('mHours', 'errMHours', !validHours(hours));
     if (bad) return;
+
+    saving = true;
+    q('mSave').disabled = true;
 
     // Сохраняем новые файлы в IndexedDB
     try {
@@ -9149,38 +9231,45 @@ function maintModal(vehicleId, maint) {
       toast('warning', 'Вложения', 'Не удалось сохранить часть файлов в локальном хранилище.');
     }
 
-    const payload = {
-      vehicleId, kind: q('mKind').value, date, hours,
-      executor: q('mExec').value.trim(),
-      unit:     q('mUnit').value.trim(),
-      works:    q('mWorks').value.trim(),
-      parts:    q('mParts').value.trim(),
-      cost:     (() => { const c = parseFloat(q('mCost').value); return (q('mCost').value !== '' && !isNaN(c) && c >= 0) ? c : ''; })(),
-      note:     q('mNote').value.trim(),
-      docs
-    };
+    try {
+      const payload = {
+        vehicleId, kind: q('mKind').value, date, hours,
+        executor: q('mExec').value.trim(),
+        unit:     q('mUnit').value.trim(),
+        works:    q('mWorks').value.trim(),
+        parts:    q('mParts').value.trim(),
+        cost:     (() => { const c = parseFloat(q('mCost').value); return (q('mCost').value !== '' && !isNaN(c) && c >= 0) ? c : ''; })(),
+        note:     q('mNote').value.trim(),
+        docs
+      };
 
-    if (isNew) {
-      const nm = Object.assign({ id: uid('m'), createdAt: new Date().toISOString() }, payload);
-      DB.maint.push(nm);
-      syncMaintHours(nm);
-    } else {
-      // Файлы, удалённые пользователем, стираем из IndexedDB
-      (maint.docs || []).forEach(old => { if (!docs.find(d => d.id === old.id)) fileDel(old.id); });
-      Object.assign(maint, payload, { updatedAt: new Date().toISOString() });
-      syncMaintHours(maint);
+      if (isNew) {
+        const nm = Object.assign({ id: uid('m'), createdAt: new Date().toISOString() }, payload);
+        DB.maint.push(nm);
+        syncMaintHours(nm);
+      } else {
+        // Файлы, удалённые пользователем, стираем из IndexedDB
+        (maint.docs || []).forEach(old => { if (!docs.find(d => d.id === old.id)) fileDel(old.id); });
+        Object.assign(maint, payload, { updatedAt: new Date().toISOString() });
+        syncMaintHours(maint);
+      }
+
+      recomputeHours(vehicleId);
+      saveDB();
+      m.close();
+
+      const st = computeStatus(getVehicle(vehicleId));
+      const next = st.nextDate ? fmtDate(st.nextDate)
+                 : (st.nextHours != null ? fmtNum(st.nextHours, 0) + ' мото·ч' : '—');
+      toast('success', isNew ? 'Запись ТО добавлена' : 'Запись ТО обновлена',
+            `Следующее обслуживание: ${next}`);
+      rerender();
+    } catch (err) {
+      // Форма остаётся открытой и доступной для повторного сохранения
+      saving = false;
+      q('mSave').disabled = false;
+      toast('danger', 'Не удалось сохранить запись', 'Проверьте данные и повторите попытку.');
     }
-
-    recomputeHours(vehicleId);
-    saveDB();
-    m.close();
-
-    const st = computeStatus(getVehicle(vehicleId));
-    const next = st.nextDate ? fmtDate(st.nextDate)
-               : (st.nextHours != null ? fmtNum(st.nextHours, 0) + ' мото·ч' : '—');
-    toast('success', isNew ? 'Запись ТО добавлена' : 'Запись ТО обновлена',
-          `Следующее обслуживание: ${next}`);
-    rerender();
   });
 }
 
@@ -9206,7 +9295,7 @@ function hoursModal(vehicleId) {
           <input id="hDate" class="f-input" type="date" value="${todayISO()}" max="${todayISO()}"></div>
         <div><label class="f-fld-label" for="hVal">Показание счётчика, мото·ч *</label>
           <input id="hVal" class="f-input" type="number" min="0" step="0.1" value="${cur}">
-          <div class="f-error" id="errVal">Укажите неотрицательное значение</div></div>
+          <div class="f-error" id="errVal">Укажите значение от 0 до 10 000 000 мото·ч</div></div>
         <div class="f-span2"><label class="f-fld-label" for="hNote">Примечание</label>
           <input id="hNote" class="f-input" placeholder="Например: снято при возвращении с выхода"></div>
         <div class="f-span2" id="hWarn" style="display:none">
@@ -9230,8 +9319,9 @@ function hoursModal(vehicleId) {
 
   q('hSave').addEventListener('click', () => {
     const val = parseFloat(String(q('hVal').value).replace(',', '.'));
-    const date = q('hDate').value || todayISO();
-    const bad = isNaN(val) || val < 0;
+    let date = q('hDate').value || todayISO();
+    if (date > todayISO()) date = todayISO();   // показание не может быть снято будущей датой
+    const bad = !validHours(val);
     q('hVal').classList.toggle('is-invalid', bad);
     q('errVal').classList.toggle('is-visible', bad);
     if (bad) return;
@@ -9394,9 +9484,20 @@ function removeDemo() {
   DB.vehicles = DB.vehicles.filter(v => !v.demo);
   DB.maint    = DB.maint.filter(m => ids.indexOf(m.vehicleId) === -1);
   DB.hours    = DB.hours.filter(h => ids.indexOf(h.vehicleId) === -1);
+  DB.trips    = DB.trips.filter(t => ids.indexOf(t.vehicleId) === -1);
+  ids.forEach(id => { if (ui.trips.vehicle === id) ui.trips.vehicle = ''; });
   saveDB();
   toast('success', 'Демо-данные удалены', 'База очищена от демонстрационных записей.');
   rerender();
+}
+
+/* Сброс ссылок интерфейса на конкретные записи — после полной замены базы
+   (восстановление из копии, очистка) идентификаторы больше не существуют */
+function resetUiSelection() {
+  ui.park.selected.clear();
+  ui.vehicleId = null;
+  ui.trips.vehicle = '';
+  ui.report.unit = '';
 }
 
 /* =========================================================================
@@ -9422,11 +9523,17 @@ function backupImport() {
         `Текущие данные будут заменены. В копии: ${parsed.vehicles.length} ед. техники.`, 'Восстановить');
       if (!ok) return;
       DB = Object.assign(blankDB(), parsed);
+      // Слияние настроек — как в loadDB, включая вложенные нормативы:
+      // частичный набор в копии не должен обнулять остальные параметры
       DB.settings = Object.assign({}, DEFAULT_SETTINGS, parsed.settings || {});
+      DB.settings.ktgByGroup = Object.assign({}, DEFAULT_SETTINGS.ktgByGroup, (parsed.settings || {}).ktgByGroup || {});
+      DB.settings.laborNorms = Object.assign({}, DEFAULT_SETTINGS.laborNorms, (parsed.settings || {}).laborNorms || {});
+      DB.settings.repairUnit = Object.assign({}, DEFAULT_SETTINGS.repairUnit, (parsed.settings || {}).repairUnit || {});
       // Защита от повреждённых данных (как при обычной загрузке из localStorage)
-      ['vehicles', 'maint', 'hours'].forEach(k => {
+      ['vehicles', 'maint', 'hours', 'trips'].forEach(k => {
         if (!Array.isArray(DB[k])) DB[k] = [];
       });
+      resetUiSelection();
       saveDB();
       toast('success', 'Данные восстановлены', `Загружено ${DB.vehicles.length} ед. техники.`);
       go('park');
@@ -9442,6 +9549,7 @@ async function wipeAll() {
     'Будут безвозвратно удалены все карточки техники, записи ТО, история моточасов и вложения.', 'Очистить');
   if (!ok) return;
   DB = blankDB();
+  resetUiSelection();
   saveDB();
   idbRun('readwrite', st => st.clear()).catch(() => memFiles.clear());
   toast('success', 'Данные очищены', 'База приведена к исходному состоянию.');

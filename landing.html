@@ -21,8 +21,11 @@
   --border: 0 0% 90%;
   --ring: 239 84% 67%;
   --radius: 0.5rem;
-  --font-display: 'Instrument Serif', serif;
-  --font-body: 'Inter', sans-serif;
+  /* Шрифты подгружаются из сети; запасные — системные, чтобы страница
+     сохраняла вид при отсутствии интернета */
+  --font-display: 'Instrument Serif', Georgia, 'Times New Roman', serif;
+  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+               'Helvetica Neue', Arial, sans-serif;
   --shadow-dashboard: 0 25px 80px -12px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0, 0, 0, 0.06);
 }
 *, *::before, *::after { box-sizing: border-box; }
@@ -300,7 +303,10 @@ a { text-decoration: none; }
 <!-- ============================= HERO (вкладка «Главная») ============================= -->
 <section id="tab-home" class="relative flex-1 overflow-hidden">
 
+  <!-- Фоновое видео внешнее: если оно недоступно (нет сети), под ним остаётся
+       мягкий градиент, и оформление секции не рассыпается -->
   <video class="absolute inset-0 w-full h-full object-cover z-0" autoplay muted loop playsinline preload="auto"
+         style="background: linear-gradient(160deg, #eef2ff 0%, #f8fafc 45%, #ede9fe 100%);"
          src="https://d8j0ntlcm91z4.cloudfront.net/user_38xzZboKViGWJOttwIXH07lWA1P/hf_20260319_015952_e1deeb12-8fb7-4071-a42a-60779fc64ab6.mp4"></video>
   <!-- Лёгкая световая подложка для читаемости текста поверх видео -->
   <div class="absolute inset-0 z-[1]" style="background: linear-gradient(180deg, rgba(255,255,255,.55), rgba(255,255,255,.15) 35%, rgba(255,255,255,.6));"></div>
