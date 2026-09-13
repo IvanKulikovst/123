@@ -5991,6 +5991,15 @@ const RESET_KINDS = new Set([
   'ТО-1', 'ТО-2', 'Сезонное обслуживание (СО)', 'Капитальный ремонт'
 ]);
 
+/* Группы эксплуатации техники — по методике планирования эксплуатации и
+   ремонта ВВСТ (ВАМТО, 2025): от группы зависит норматив КТГ и годовые
+   нормы расхода ресурса. */
+const EXP_GROUPS = ['Боевая', 'Строевая', 'Учебно-боевая', 'Учебно-строевая'];
+
+/* Виды работ, для которых в методике приводятся нормативы трудоёмкости
+   (используются в расчётах потребности в ТО, фонда времени и экономики). */
+const LABOR_KINDS = ['ТО-1', 'ТО-2', 'ТР'];
+
 /* Настройки по умолчанию */
 const DEFAULT_SETTINGS = {
   defaultHours:   250,   // межсервисный интервал по моточасам
@@ -5998,7 +6007,23 @@ const DEFAULT_SETTINGS = {
   warnPct:        30,    // 🟡 порог «осталось менее 30%»
   urgentPct:      10,    // 🟠 порог «обслужить в ближайшее время»
   hoursStaleDays: 14,    // напоминание об обновлении моточасов
-  notifyOnStart:  true   // всплывающая сводка при открытии раздела
+  notifyOnStart:  true,  // всплывающая сводка при открытии раздела
+
+  /* --- Нормативные параметры планирования (методика ВАМТО, 2025) --- */
+  ktgByGroup: {           // норматив КТГ по группам эксплуатации
+    'Боевая': 0.95, 'Строевая': 0.90, 'Учебно-боевая': 0.85, 'Учебно-строевая': 0.85
+  },
+  periodTO1: 2000,        // периодичность ТО-1 по умолчанию, мото·ч (км)
+  periodTO2: 12000,       // периодичность ТО-2 по умолчанию, мото·ч (км)
+  periodTR:  1000,        // периодичность текущего ремонта, мото·ч (км) — формула (7)
+  laborNorms: { 'ТО-1': 5, 'ТО-2': 27, 'ТР': 3 },  // нормативная трудоёмкость, чел.-ч
+  normHourCost: 350,      // стоимость нормочаса Снч, руб. — формула Эф = Трт·Снч
+  repairUnit: {           // ремонтное подразделение — расчёт фонда рабочего времени
+    specialists: 4,       // количество производственников, чел.
+    workDaysMonth: 20,    // рабочих дней в месяце, отводимых на ТО и ремонт (методика, 3.12)
+    hoursPerDay: 7,       // продолжительность рабочего дня, ч
+    nonProdPct: 3         // вынужденные потери, % от годового фонда (методика, 3.9)
+  }
 };
 
 /* Уровни состояния ТО — единая таблица соответствий */
@@ -6122,6 +6147,7 @@ function blankDB() {
     vehicles: [],
     maint: [],
     hours: [],
+    trips: [],
     settings: Object.assign({}, DEFAULT_SETTINGS),
     seeded: false
   };
@@ -6134,8 +6160,11 @@ function loadDB() {
     const parsed = JSON.parse(raw);
     DB = Object.assign(blankDB(), parsed);
     DB.settings = Object.assign({}, DEFAULT_SETTINGS, parsed.settings || {});
+    DB.settings.ktgByGroup  = Object.assign({}, DEFAULT_SETTINGS.ktgByGroup,  (parsed.settings || {}).ktgByGroup  || {});
+    DB.settings.laborNorms  = Object.assign({}, DEFAULT_SETTINGS.laborNorms,  (parsed.settings || {}).laborNorms  || {});
+    DB.settings.repairUnit  = Object.assign({}, DEFAULT_SETTINGS.repairUnit,  (parsed.settings || {}).repairUnit  || {});
     // Защита от повреждённых данных
-    ['vehicles', 'maint', 'hours'].forEach(k => {
+    ['vehicles', 'maint', 'hours', 'trips'].forEach(k => {
       if (!Array.isArray(DB[k])) DB[k] = [];
     });
   } catch (e) {
@@ -6220,6 +6249,21 @@ function hoursOf(vehicleId) {
     .filter(h => h.vehicleId === vehicleId)
     .sort((a, b) => (b.date || '').localeCompare(a.date || '') ||
                     (b.createdAt || '').localeCompare(a.createdAt || ''));
+}
+
+/* Путевые листы по единице техники, от новых к старым */
+function tripsOf(vehicleId) {
+  return DB.trips
+    .filter(t => t.vehicleId === vehicleId)
+    .sort((a, b) => (b.date || '').localeCompare(a.date || '') ||
+                    (b.createdAt || '').localeCompare(a.createdAt || ''));
+}
+
+/* Годовая наработка техники: сумма приростов моточасов за календарный год */
+function hoursInYear(vehicleId, year) {
+  return hoursOf(vehicleId)
+    .filter(h => h.date && h.date.slice(0, 4) === String(year) && h.delta > 0)
+    .reduce((s, h) => s + Number(h.delta || 0), 0);
 }
 
 /* Последнее ТО, сбрасывающее межсервисный интервал (ЕО и ремонты не в счёт) */
@@ -6577,7 +6621,10 @@ const FI = {
   grid:    p => S('<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>', p),
   save:    p => S('<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>', p),
   upload:  p => S('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>', p),
-  building:p => S('<rect x="4" y="2" width="16" height="20" rx="2"/><line x1="9" y1="7" x2="15" y2="7"/><line x1="9" y1="11" x2="15" y2="11"/><line x1="9" y1="15" x2="15" y2="15"/>', p)
+  building:p => S('<rect x="4" y="2" width="16" height="20" rx="2"/><line x1="9" y1="7" x2="15" y2="7"/><line x1="9" y1="11" x2="15" y2="11"/><line x1="9" y1="15" x2="15" y2="15"/>', p),
+  route:   p => S('<circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M8 19h7a4 4 0 0 0 4-4v-1a4 4 0 0 0-4-4H9a4 4 0 0 1-4-4V5"/>', p),
+  calc:    p => S('<rect x="4" y="2" width="16" height="20" rx="2"/><line x1="8" y1="6" x2="16" y2="6"/><line x1="8" y1="11" x2="8.01" y2="11"/><line x1="12" y1="11" x2="12.01" y2="11"/><line x1="16" y1="11" x2="16.01" y2="11"/><line x1="8" y1="15" x2="8.01" y2="15"/><line x1="12" y1="15" x2="12.01" y2="15"/><line x1="16" y1="15" x2="16.01" y2="15"/><line x1="8" y1="19" x2="8.01" y2="19"/><line x1="12" y1="19" x2="12.01" y2="19"/><line x1="16" y1="19" x2="16.01" y2="19"/>', p),
+  file:    p => S('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="9" y1="13" x2="15" y2="13"/><line x1="9" y1="17" x2="13" y2="17"/>', p)
 };
 
 /* =========================================================================
@@ -6594,7 +6641,11 @@ const ui = {
     selected: new Set()   // id-ы отмеченных чекбоксами единиц техники (массовые операции)
   },
   dash:   { sort: { key: 'pct', dir: 'asc' } },
-  report: { key: 'vehicles', from: '', to: '', unit: '' }
+  report: { key: 'vehicles', from: '', to: '', unit: '' },
+  trips:  { vehicle: '', from: '', to: '' },
+  planTab: 'ktg',
+  docs:    { actFrom: addDays(todayISO(), -30), actTo: todayISO() },
+  econ:    { from: '', to: '' }
 };
 
 /* Короткие ссылки на DOM */
@@ -6782,6 +6833,9 @@ function options(list, selected, placeholder) {
 const NAV = [
   { key: 'park',      label: 'Парк техники',            icon: FI.truck },
   { key: 'dashboard', label: 'Ближайшие ТО',            icon: FI.alert },
+  { key: 'trips',     label: 'Путевые листы',           icon: FI.route },
+  { key: 'planning',  label: 'Планирование',            icon: FI.calc  },
+  { key: 'documents', label: 'Документы',               icon: FI.file  },
   { key: 'reports',   label: 'Отчёты',                  icon: FI.chart },
   { key: 'settings',  label: 'Настройки',               icon: FI.gear  }
 ];
@@ -6820,6 +6874,9 @@ function renderView() {
       }
       break;
     case 'dashboard': v.innerHTML = renderDashboard(); break;
+    case 'trips':     v.innerHTML = renderTrips();     bindTripFilters(); break;
+    case 'planning':  v.innerHTML = renderPlanning();  bindPlanningInputs(); break;
+    case 'documents': v.innerHTML = renderDocuments(); bindDocuments(); break;
     case 'reports':   v.innerHTML = renderReports();   bindReportFilters(); break;
     case 'settings':  v.innerHTML = renderSettings();  bindSettings(); break;
   }
@@ -7174,6 +7231,9 @@ function renderVehicleInfo(v, st) {
         ${F('Год выпуска', v.year)}
         ${F('Дата постановки на учёт', v.regDate ? fmtDate(v.regDate) : '')}
         ${F('Статус', v.status)}
+        ${F('Группа эксплуатации', v.expGroup)}
+        ${F('Плановая годовая наработка', v.annualPlanHours !== '' && v.annualPlanHours != null ? fmtNum(v.annualPlanHours, 0) + ' мото·ч' : '')}
+        ${F('Годовая норма расхода ресурса', v.annualNormHours !== '' && v.annualNormHours != null ? fmtNum(v.annualNormHours, 0) + ' мото·ч' : '')}
         ${F('Периодичность ТО', rules.length ? rules.join(' или ') : 'не задана')}
         ${F('Моточасы обновлены', v.hoursUpdatedAt ? fmtDate(v.hoursUpdatedAt) : '')}
       </div>
@@ -7265,7 +7325,7 @@ function renderVehicleHours(v, hs) {
               <td class="f-td-num f-td-strong">${fmtNum(h.value, 0)}</td>
               <td class="f-td-num" style="color:${h.delta > 0 ? 'var(--success)' : 'var(--text-secondary)'}">
                 ${h.delta > 0 ? '+' + fmtNum(h.delta, 0) : (h.delta === 0 ? '0' : fmtNum(h.delta, 0))}</td>
-              <td><span class="f-badge f-badge-neutral">${h.source === 'maint' ? 'запись ТО' : 'вручную'}</span></td>
+              <td><span class="f-badge f-badge-neutral">${h.source === 'maint' ? 'запись ТО' : (h.source === 'trip' ? 'путевой лист' : 'вручную')}</span></td>
               <td>${h.note ? esc(h.note) : '<span class="f-td-muted">—</span>'}</td>
               <td><button type="button" class="f-icon-btn is-danger" data-act="del-hours" data-id="${h.id}" title="Удалить">${FI.trash(15)}</button></td>
             </tr>`).join('')}
@@ -7321,6 +7381,27 @@ function removeMaint(m) {
   DB.hours = DB.hours.filter(h => h.maintId !== m.id);
   (m.docs || []).forEach(d => fileDel(d.id));
   recomputeHours(m.vehicleId);
+  saveDB();
+}
+
+/* Путевой лист фиксирует показание счётчика на конец выхода — синхронизируем
+   историю моточасов, как и при записи ТО (syncMaintHours). */
+function syncTripHours(t) {
+  let entry = DB.hours.find(h => h.tripId === t.id);
+  if (!entry) {
+    entry = { id: uid('h'), vehicleId: t.vehicleId, tripId: t.id,
+              source: 'trip', createdAt: new Date().toISOString() };
+    DB.hours.push(entry);
+  }
+  entry.date  = t.date;
+  entry.value = Number(t.endHours || 0);
+  entry.note  = 'Путевой лист' + (t.driver ? ' · ' + t.driver : '') + (t.purpose ? ' — ' + t.purpose : '');
+}
+
+function removeTrip(t) {
+  DB.trips = DB.trips.filter(x => x.id !== t.id);
+  DB.hours = DB.hours.filter(h => h.tripId !== t.id);
+  recomputeHours(t.vehicleId);
   saveDB();
 }
 
@@ -7438,6 +7519,800 @@ function refreshDash() {
 }
 
 /* =========================================================================
+   17a. РАЗДЕЛ «ПУТЕВЫЕ ЛИСТЫ»
+   -------------------------------------------------------------------------
+   Ежедневный учёт выхода техники (кто, куда, показание счётчика на начало
+   и конец выхода). Методика ВАМТО (2025), гл. 3: наряд на использование
+   машин и путевой лист — ежедневные документы, на основании которых
+   ведётся карточка учёта работы машины и сводная ведомость за месяц.
+   Каждый путевой лист синхронизирован с историей моточасов (syncTripHours),
+   поэтому расход ресурса из путевых листов автоматически учитывается в
+   расчёте срока ТО, наличия моторесурса и потребности в ТО.
+   ========================================================================= */
+
+function tripRows() {
+  const f = ui.trips;
+  return DB.trips
+    .filter(t => !f.vehicle || t.vehicleId === f.vehicle)
+    .filter(t => (!f.from || t.date >= f.from) && (!f.to || t.date <= f.to))
+    .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.createdAt || '').localeCompare(a.createdAt || ''));
+}
+
+function renderTrips() {
+  const rows = tripRows();
+
+  return `
+    <div class="f-page-head">
+      <div>
+        <div class="f-page-title">Путевые листы</div>
+        <div class="f-page-sub">Ежедневный учёт выхода техники — основа карточки учёта работы машины</div>
+      </div>
+      <div class="f-page-actions">
+        <button type="button" class="f-btn f-btn-primary" data-act="add-trip">${FI.plus(15)}<span>Путевой лист</span></button>
+      </div>
+    </div>
+
+    <div class="f-toolbar">
+      <div class="f-fld"><label class="f-fld-label" for="tripVehicle">Техника</label>
+        <select id="tripVehicle" class="f-select"></select>
+      </div>
+      <div class="f-fld"><label class="f-fld-label" for="tripFrom">Период с</label>
+        <input id="tripFrom" class="f-input" type="date" value="${esc(ui.trips.from)}"></div>
+      <div class="f-fld"><label class="f-fld-label" for="tripTo">Период по</label>
+        <input id="tripTo" class="f-input" type="date" value="${esc(ui.trips.to)}"></div>
+      <div class="f-toolbar-end">
+        <button type="button" class="f-btn f-btn-ghost" data-act="reset-trips">Сбросить</button>
+      </div>
+    </div>
+
+    <div id="tripResults">${renderTripResults(rows)}</div>`;
+}
+
+function renderTripResults(rows) {
+  rows = rows || tripRows();
+  if (!rows.length) {
+    return `<div class="f-panel">` + emptyState(FI.route(28), 'Путевых листов пока нет',
+      'Добавьте первый путевой лист — показания на конец выхода будут учтены в истории моточасов.',
+      `<button type="button" class="f-btn f-btn-primary" data-act="add-trip">Добавить путевой лист</button>`) + `</div>`;
+  }
+
+  return `
+    <div class="f-table-wrap"><div class="f-table-scroll">
+      <table class="f-table">
+        <thead><tr>
+          <th>Дата</th><th>Техника</th><th>Водитель</th><th>Маршрут / задача</th>
+          <th class="f-td-num">Показание на начало</th><th class="f-td-num">Показание на конец</th>
+          <th class="f-td-num">Наработка за выход</th><th style="width:80px"></th>
+        </tr></thead>
+        <tbody>
+          ${rows.map(t => {
+            const v = getVehicle(t.vehicleId);
+            const dist = (t.endHours != null && t.startHours != null) ? Number(t.endHours) - Number(t.startHours) : null;
+            return `
+            <tr>
+              <td class="f-td-nowrap">${fmtDate(t.date)}</td>
+              <td class="f-td-strong">${v ? esc(v.name) : '<span class="f-td-muted">техника удалена</span>'}${v && v.regNumber ? ' <span class="f-plate" style="margin-left:6px">' + esc(v.regNumber) + '</span>' : ''}</td>
+              <td>${esc(t.driver || '—')}</td>
+              <td style="max-width:260px">${t.purpose ? esc(t.purpose) : '<span class="f-td-muted">—</span>'}</td>
+              <td class="f-td-num">${fmtNum(t.startHours, 0)}</td>
+              <td class="f-td-num">${fmtNum(t.endHours, 0)}</td>
+              <td class="f-td-num f-td-strong">${dist != null ? fmtNum(dist, 0) : '—'}</td>
+              <td><div class="f-row-actions">
+                <button type="button" class="f-icon-btn" data-act="edit-trip" data-id="${t.id}" title="Редактировать">${FI.edit(15)}</button>
+                <button type="button" class="f-icon-btn is-danger" data-act="del-trip" data-id="${t.id}" title="Удалить">${FI.trash(15)}</button>
+              </div></td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div></div>`;
+}
+
+function refreshTrips() {
+  const box = el('tripResults');
+  if (box) box.innerHTML = renderTripResults();
+}
+
+function bindTripFilters() {
+  const sel = el('tripVehicle');
+  if (sel) {
+    sel.innerHTML = `<option value="">Все</option>` +
+      DB.vehicles.map(v => `<option value="${esc(v.id)}"${v.id === ui.trips.vehicle ? ' selected' : ''}>${esc(v.name)}${v.regNumber ? ' · ' + esc(v.regNumber) : ''}</option>`).join('');
+    sel.addEventListener('change', () => { ui.trips.vehicle = sel.value; refreshTrips(); });
+  }
+  const bind = (id, prop) => {
+    const n = el(id);
+    if (n) n.addEventListener('change', () => { ui.trips[prop] = n.value; refreshTrips(); });
+  };
+  bind('tripFrom', 'from');
+  bind('tripTo', 'to');
+}
+
+/* Форма путевого листа */
+function tripModal(trip) {
+  const isNew = !trip;
+  const active = DB.vehicles.filter(v => v.status !== 'Списано');
+  const t = trip || {
+    vehicleId: active[0] ? active[0].id : '', date: todayISO(), driver: '', purpose: '',
+    startHours: '', endHours: '', note: ''
+  };
+  const vForStart = getVehicle(t.vehicleId);
+
+  const m = openModal(`
+    <div class="f-modal-head">
+      <div>
+        <div class="f-modal-title">${isNew ? 'Новый путевой лист' : 'Редактирование путевого листа'}</div>
+        <div class="f-modal-sub">Ежедневный учёт выхода техники</div>
+      </div>
+      <button type="button" class="f-modal-close" data-close aria-label="Закрыть">${FI.x(16)}</button>
+    </div>
+    <div class="f-modal-body">
+      <div class="f-form-grid">
+        <div><label class="f-fld-label" for="tVeh">Техника *</label>
+          <select id="tVeh" class="f-select">${active.map(v => `<option value="${esc(v.id)}"${v.id === t.vehicleId ? ' selected' : ''}>${esc(v.name)}${v.regNumber ? ' · ' + esc(v.regNumber) : ''}</option>`).join('')}</select></div>
+        <div><label class="f-fld-label" for="tDate">Дата выхода *</label>
+          <input id="tDate" class="f-input" type="date" value="${esc(t.date)}" max="${todayISO()}"></div>
+        <div><label class="f-fld-label" for="tDriver">Водитель (расчёт)</label>
+          <input id="tDriver" class="f-input" value="${esc(t.driver)}" placeholder="ефрейтор Сидоров С.С."></div>
+        <div><label class="f-fld-label" for="tPurpose">Маршрут / задача</label>
+          <input id="tPurpose" class="f-input" value="${esc(t.purpose)}" placeholder="Подвоз горячей пищи на полигон"></div>
+        <div><label class="f-fld-label" for="tStart">Показание на начало выхода *</label>
+          <input id="tStart" class="f-input" type="number" min="0" step="0.1" value="${t.startHours !== '' ? t.startHours : (vForStart ? Number(vForStart.currentHours || 0) : 0)}">
+          <div class="f-error" id="errStart">Укажите неотрицательное значение</div></div>
+        <div><label class="f-fld-label" for="tEnd">Показание на конец выхода *</label>
+          <input id="tEnd" class="f-input" type="number" min="0" step="0.1" value="${t.endHours}">
+          <div class="f-error" id="errEnd">Должно быть не меньше показания на начало</div></div>
+        <div class="f-span2"><label class="f-fld-label" for="tNote">Примечание</label>
+          <input id="tNote" class="f-input" value="${esc(t.note)}"></div>
+      </div>
+    </div>
+    <div class="f-modal-foot">
+      <button type="button" class="f-btn" data-close>Отмена</button>
+      <button type="button" class="f-btn f-btn-primary" id="tSave">${FI.save(15)}<span>Сохранить</span></button>
+    </div>`);
+
+  const R = m.root;
+  const q = id => R.querySelector('#' + id);
+
+  q('tVeh').addEventListener('change', () => {
+    if (!isNew) return;
+    const veh = getVehicle(q('tVeh').value);
+    if (veh) q('tStart').value = Number(veh.currentHours || 0);
+  });
+
+  q('tSave').addEventListener('click', () => {
+    const vehicleId = q('tVeh').value;
+    const date = q('tDate').value;
+    const start = parseFloat(String(q('tStart').value).replace(',', '.'));
+    const end   = parseFloat(String(q('tEnd').value).replace(',', '.'));
+
+    let bad = false;
+    const setErr = (inputId, errId, cond) => {
+      q(inputId).classList.toggle('is-invalid', cond);
+      q(errId).classList.toggle('is-visible', cond);
+      if (cond) bad = true;
+    };
+    setErr('tStart', 'errStart', isNaN(start) || start < 0);
+    setErr('tEnd', 'errEnd', isNaN(end) || end < start);
+    if (!vehicleId || !date) bad = true;
+    if (bad) return;
+
+    const payload = {
+      vehicleId, date, driver: q('tDriver').value.trim(), purpose: q('tPurpose').value.trim(),
+      startHours: start, endHours: end, note: q('tNote').value.trim()
+    };
+
+    if (isNew) {
+      const nt = Object.assign({ id: uid('t'), createdAt: new Date().toISOString() }, payload);
+      DB.trips.push(nt);
+      syncTripHours(nt);
+    } else {
+      Object.assign(trip, payload, { updatedAt: new Date().toISOString() });
+      syncTripHours(trip);
+    }
+
+    recomputeHours(vehicleId);
+    saveDB();
+    m.close();
+    toast('success', isNew ? 'Путевой лист добавлен' : 'Путевой лист обновлён', `Наработка за выход: ${fmtNum(end - start, 0)} мото·ч`);
+    rerender();
+  });
+}
+
+/* =========================================================================
+   17b. РАЗДЕЛ «ПЛАНИРОВАНИЕ»
+   -------------------------------------------------------------------------
+   Расчётные методики из учебного пособия «Методика планирования
+   эксплуатации и ремонта ВВСТ» (ВАМТО, 2025), гл. 3: группы эксплуатации
+   и КТГ, наличие моторесурса, потребность в ТО и трудозатратах на год,
+   фонд рабочего времени ремонтного подразделения, экономическая
+   эффективность и загрузка производственных возможностей.
+   Расчёты приближённые и опираются на нормативы, заданные в настройках —
+   они предназначены для оценки, а не заменяют официальные формы приказов.
+   ========================================================================= */
+
+/* --- A. Группы эксплуатации и КТГ (формула 4) --- */
+function ktgSummary() {
+  return EXP_GROUPS.map(group => {
+    const list = DB.vehicles.filter(v => v.expGroup === group && v.status !== 'Списано');
+    const total = list.length;
+    const inRepair = list.filter(v => v.status === 'Ремонт').length;
+    const ktg = Number(DB.settings.ktgByGroup[group] != null ? DB.settings.ktgByGroup[group] : 0.9);
+    const allowed = total > 0 ? Math.max(0, Math.floor(total * (1 - ktg)) - 1) : 0;
+    return { group, ktg, total, inRepair, allowed, exceeded: total > 0 && inRepair > allowed };
+  });
+}
+
+/* --- B. Наличие моторесурса: годовые нормы, 5% резерв, факт/остаток (3.7) --- */
+function resourceSummary() {
+  const year = new Date().getFullYear();
+  return DB.vehicles.filter(v => v.status !== 'Списано').map(v => {
+    const norm = Number(v.annualNormHours || 0);
+    const used = hoursInYear(v.id, year);
+    const reserve = norm * 0.05;
+    const allowed = norm - reserve;
+    const remaining = norm > 0 ? allowed - used : null;
+    return { v, norm, used, reserve, allowed, remaining, normSet: norm > 0, exceeded: norm > 0 && used > allowed };
+  });
+}
+
+/* --- C. Потребность в ТО-1/ТО-2/ТР и трудозатратах на год (формулы 5-10) ---
+   Считается по группам «марка × группа эксплуатации» — так же, как в
+   методике (LГij — суммарный годовой пробег/наработка группы машин). */
+function toNeedByGroup() {
+  const s = DB.settings;
+  const map = new Map();
+  DB.vehicles.filter(v => v.status !== 'Списано' && Number(v.annualPlanHours) > 0).forEach(v => {
+    const key = (v.brand || v.name) + '||' + (v.expGroup || '—');
+    if (!map.has(key)) map.set(key, { brand: v.brand || v.name, group: v.expGroup || '—', count: 0, Lgod: 0 });
+    const r = map.get(key);
+    r.count++;
+    r.Lgod += Number(v.annualPlanHours || 0);
+  });
+  return Array.from(map.values()).map(r => {
+    const nTO2 = Math.floor(r.Lgod / s.periodTO2);
+    const nTO1 = Math.max(0, Math.floor(r.Lgod / s.periodTO1) - nTO2);
+    const nTR  = Math.floor(r.Lgod / s.periodTR);
+    const tTO1 = nTO1 * Number(s.laborNorms['ТО-1'] || 0);
+    const tTO2 = nTO2 * Number(s.laborNorms['ТО-2'] || 0);
+    const tTR  = nTR  * Number(s.laborNorms['ТР']   || 0);
+    return Object.assign(r, { nTO1, nTO2, nTR, tTO1, tTO2, tTR, tTotal: tTO1 + tTO2 + tTR });
+  }).sort((a, b) => a.brand.localeCompare(b.brand, 'ru'));
+}
+
+/* --- E. Фонд рабочего времени ремонтного подразделения (формулы 21-24, 3.12) --- */
+function repairFund() {
+  const r = DB.settings.repairUnit;
+  const monthlyPerSpecialist = Number(r.workDaysMonth) * Number(r.hoursPerDay);
+  const annualPerSpecialist  = monthlyPerSpecialist * 12 * (1 - Number(r.nonProdPct) / 100);
+  return {
+    specialists: Number(r.specialists) || 0,
+    monthlyPerSpecialist,
+    annualPerSpecialist,
+    monthlyTotal: monthlyPerSpecialist * (Number(r.specialists) || 0),
+    annualTotal:  annualPerSpecialist  * (Number(r.specialists) || 0)
+  };
+}
+
+/* --- H. Экономическая эффективность и загрузка мощностей (3.12) --- */
+function economicsSummary(from, to) {
+  const s = DB.settings;
+  const kindMap = { 'ТО-1': 'ТО-1', 'ТО-2': 'ТО-2', 'Текущий ремонт': 'ТР' };
+  const records = DB.maint.filter(m => (!from || m.date >= from) && (!to || m.date <= to) && kindMap[m.kind]);
+
+  const byKind = { 'ТО-1': { count: 0, hours: 0 }, 'ТО-2': { count: 0, hours: 0 }, 'ТР': { count: 0, hours: 0 } };
+  const months = new Set();
+  records.forEach(m => {
+    const key = kindMap[m.kind];
+    const t = Number(s.laborNorms[key] || 0);
+    byKind[key].count++;
+    byKind[key].hours += t;
+    if (m.date) months.add(m.date.slice(0, 7));
+  });
+  const totalHours = byKind['ТО-1'].hours + byKind['ТО-2'].hours + byKind['ТР'].hours;
+  const ef = totalHours * Number(s.normHourCost || 0);
+  const fund = repairFund();
+  const monthsCount = Math.max(1, months.size);
+  const periodFund = fund.monthlyTotal * monthsCount;
+  const loadPct = periodFund > 0 ? (totalHours / periodFund) * 100 : null;
+  return { records: records.length, byKind, totalHours, ef, fund, monthsCount, periodFund, loadPct };
+}
+
+const PLAN_TABS = [
+  { key: 'ktg',      label: 'Группы и КТГ' },
+  { key: 'resource', label: 'Моторесурс' },
+  { key: 'labor',    label: 'Потребность в ТО' },
+  { key: 'repair',   label: 'Ремонтное подразделение' },
+  { key: 'economy',  label: 'Экономика' }
+];
+
+function renderPlanning() {
+  return `
+    <div class="f-page-head">
+      <div>
+        <div class="f-page-title">Планирование</div>
+        <div class="f-page-sub">Расчёты по методике планирования эксплуатации и ремонта ВВСТ (ВАМТО, 2025)</div>
+      </div>
+    </div>
+    <div class="f-tabs">
+      ${PLAN_TABS.map(t => `<button type="button" class="f-tab ${ui.planTab === t.key ? 'is-active' : ''}" data-act="plantab" data-tab="${t.key}">${esc(t.label)}</button>`).join('')}
+    </div>
+    <div id="planBody">${renderPlanTab()}</div>`;
+}
+
+function renderPlanTab() {
+  switch (ui.planTab) {
+    case 'ktg':      return renderPlanKtg();
+    case 'resource': return renderPlanResource();
+    case 'labor':    return renderPlanLabor();
+    case 'repair':   return renderPlanRepair();
+    case 'economy':  return renderPlanEconomy();
+    default:         return '';
+  }
+}
+
+function refreshPlanTab() {
+  const box = el('planBody');
+  if (box) box.innerHTML = renderPlanTab();
+}
+
+function renderPlanKtg() {
+  const rows = ktgSummary();
+  return `
+    <div class="f-panel">
+      <div class="f-panel-title">Допустимое количество машин одновременно в ремонте</div>
+      <div class="f-hint" style="margin-bottom:12px">Формула методики: M<sub>план.рем</sub> = M<sub>списочн</sub>·(1 − КТГ) − 1. Норматив КТГ по группам задаётся в настройках.</div>
+      <div class="f-table-wrap"><div class="f-table-scroll">
+        <table class="f-table">
+          <thead><tr>
+            <th>Группа эксплуатации</th><th class="f-td-num" style="width:120px">Норматив КТГ</th>
+            <th class="f-td-num">Списочный состав</th><th class="f-td-num">Допустимо в ремонте</th>
+            <th class="f-td-num">Фактически в ремонте</th><th>Состояние</th>
+          </tr></thead>
+          <tbody>
+            ${rows.map(r => `
+              <tr>
+                <td class="f-td-strong">${esc(r.group)}</td>
+                <td class="f-td-num"><input class="f-input" data-ktg-group="${esc(r.group)}" type="number" min="0.01" max="0.99" step="0.01" value="${r.ktg}" style="width:80px;text-align:right"></td>
+                <td class="f-td-num">${r.total}</td>
+                <td class="f-td-num">${r.allowed}</td>
+                <td class="f-td-num" style="${r.exceeded ? 'color:var(--st-overdue);font-weight:600' : ''}">${r.inRepair}</td>
+                <td>${r.total === 0 ? '<span class="f-td-muted">нет техники</span>' : (r.exceeded ? levelBadge('overdue') : levelBadge('ok'))}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div></div>
+      <div class="f-hint" style="margin-top:10px">Группа эксплуатации задаётся в карточке техники (вкладка «Основные сведения» → раздел «Планирование эксплуатации»).</div>
+    </div>`;
+}
+
+function renderPlanResource() {
+  const rows = resourceSummary().filter(r => r.normSet);
+  const skipped = resourceSummary().length - rows.length;
+  return `
+    <div class="f-panel">
+      <div class="f-panel-title">Наличие моторесурса на ${new Date().getFullYear()} год</div>
+      <div class="f-hint" style="margin-bottom:12px">Резерв — 5% от годовой нормы (на инспектирование и итоговые проверки). Разрешаемый расход = норма − резерв.</div>
+      ${!rows.length ? emptyState(FI.gauge(28), 'Нет данных для расчёта',
+        'Укажите годовую норму расхода ресурса в карточках техники, чтобы увидеть расчёт наличия моторесурса.') : `
+      <div class="f-table-wrap"><div class="f-table-scroll">
+        <table class="f-table">
+          <thead><tr>
+            <th>Техника</th><th>Группа</th><th class="f-td-num">Годовая норма</th>
+            <th class="f-td-num">Резерв 5%</th><th class="f-td-num">Разрешено</th>
+            <th class="f-td-num">Израсходовано за год</th><th class="f-td-num">Остаток</th><th></th>
+          </tr></thead>
+          <tbody>
+            ${rows.map(r => `
+              <tr>
+                <td class="f-td-strong">${esc(r.v.name)}</td>
+                <td>${esc(r.v.expGroup || '—')}</td>
+                <td class="f-td-num">${fmtNum(r.norm, 0)}</td>
+                <td class="f-td-num">${fmtNum(r.reserve, 0)}</td>
+                <td class="f-td-num">${fmtNum(r.allowed, 0)}</td>
+                <td class="f-td-num">${fmtNum(r.used, 0)}</td>
+                <td class="f-td-num" style="${r.exceeded ? 'color:var(--st-overdue);font-weight:600' : ''}">${fmtNum(r.remaining, 0)}</td>
+                <td>${r.exceeded ? levelBadge('overdue') : levelBadge('ok')}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div></div>`}
+      ${skipped ? `<div class="f-hint" style="margin-top:10px">Без заданной годовой нормы: ${skipped} ед. техники — не включены в расчёт.</div>` : ''}
+    </div>`;
+}
+
+function renderPlanLabor() {
+  const rows = toNeedByGroup();
+  const s = DB.settings;
+  const totalT = rows.reduce((sum, r) => sum + r.tTotal, 0);
+  return `
+    <div class="f-panel">
+      <div class="f-panel-title">Нормативы для расчёта (периодичность и трудоёмкость)</div>
+      <div class="f-form-grid">
+        <div><label class="f-fld-label" for="perTO1">Периодичность ТО-1, мото·ч (км)</label>
+          <input id="perTO1" class="f-input" type="number" min="1" step="1" value="${s.periodTO1}"></div>
+        <div><label class="f-fld-label" for="perTO2">Периодичность ТО-2, мото·ч (км)</label>
+          <input id="perTO2" class="f-input" type="number" min="1" step="1" value="${s.periodTO2}"></div>
+        <div><label class="f-fld-label" for="perTR">Периодичность ТР, мото·ч (км)</label>
+          <input id="perTR" class="f-input" type="number" min="1" step="1" value="${s.periodTR}"></div>
+        <div><label class="f-fld-label" for="laborTO1">Трудоёмкость ТО-1, чел.-ч</label>
+          <input id="laborTO1" class="f-input" type="number" min="0" step="0.1" value="${s.laborNorms['ТО-1']}"></div>
+        <div><label class="f-fld-label" for="laborTO2">Трудоёмкость ТО-2, чел.-ч</label>
+          <input id="laborTO2" class="f-input" type="number" min="0" step="0.1" value="${s.laborNorms['ТО-2']}"></div>
+        <div><label class="f-fld-label" for="laborTR">Трудоёмкость ТР, чел.-ч</label>
+          <input id="laborTR" class="f-input" type="number" min="0" step="0.1" value="${s.laborNorms['ТР']}"></div>
+      </div>
+    </div>
+    <div class="f-panel">
+      <div class="f-panel-title">Потребность в ТО-1 / ТО-2 / ТР и трудозатраты на год</div>
+      <div class="f-hint" style="margin-bottom:12px">
+        N(ТО-2) = L<sub>год</sub>/${fmtNum(s.periodTO2,0)}; N(ТО-1) = L<sub>год</sub>/${fmtNum(s.periodTO1,0)} − N(ТО-2); N(ТР) = L<sub>год</sub>/${fmtNum(s.periodTR,0)}.
+        Трудозатраты — по нормативам из настроек (ТО-1: ${s.laborNorms['ТО-1']} чел.-ч, ТО-2: ${s.laborNorms['ТО-2']} чел.-ч, ТР: ${s.laborNorms['ТР']} чел.-ч).
+      </div>
+      ${!rows.length ? emptyState(FI.calc(28), 'Нет данных для расчёта',
+        'Укажите плановую годовую наработку в карточках техники, чтобы рассчитать потребность в ТО и трудозатраты.') : `
+      <div class="f-table-wrap"><div class="f-table-scroll">
+        <table class="f-table">
+          <thead><tr>
+            <th>Марка</th><th>Группа</th><th class="f-td-num">Единиц</th><th class="f-td-num">L<sub>год</sub>, мото·ч</th>
+            <th class="f-td-num">ТО-1, шт.</th><th class="f-td-num">ТО-2, шт.</th><th class="f-td-num">ТР, шт.</th>
+            <th class="f-td-num">Трудозатраты, чел.-ч</th>
+          </tr></thead>
+          <tbody>
+            ${rows.map(r => `
+              <tr>
+                <td class="f-td-strong">${esc(r.brand)}</td>
+                <td>${esc(r.group)}</td>
+                <td class="f-td-num">${r.count}</td>
+                <td class="f-td-num">${fmtNum(r.Lgod, 0)}</td>
+                <td class="f-td-num">${r.nTO1}</td>
+                <td class="f-td-num">${r.nTO2}</td>
+                <td class="f-td-num">${r.nTR}</td>
+                <td class="f-td-num f-td-strong">${fmtNum(r.tTotal, 0)}</td>
+              </tr>`).join('')}
+          </tbody>
+          <tfoot><tr>
+            <td colspan="7" class="f-td-strong" style="text-align:right">Итого трудозатрат на год</td>
+            <td class="f-td-num f-td-strong">${fmtNum(totalT, 0)}</td>
+          </tr></tfoot>
+        </table>
+      </div></div>`}
+    </div>
+    ${rows.length ? `
+    <div class="f-panel">
+      <div class="f-panel-title">Хватает ли сил ремонтного подразделения</div>
+      ${(() => {
+        const fund = repairFund();
+        const enough = fund.annualTotal >= totalT;
+        return `
+        <div class="f-info-grid">
+          <div><div class="f-info-k">Требуется трудозатрат на год</div><div class="f-info-v">${fmtNum(totalT, 0)} чел.-ч</div></div>
+          <div><div class="f-info-k">Годовой фонд рабочего времени подразделения</div><div class="f-info-v">${fmtNum(fund.annualTotal, 0)} чел.-ч</div></div>
+          <div><div class="f-info-k">Вывод</div><div class="f-info-v" style="color:${enough ? 'var(--success)' : 'var(--st-overdue)'}">${enough ? 'Сил и средств достаточно' : 'Требуется усиление подразделения'}</div></div>
+        </div>`;
+      })()}
+    </div>` : ''}`;
+}
+
+function renderPlanRepair() {
+  const r = DB.settings.repairUnit;
+  const fund = repairFund();
+  return `
+    <div class="f-panel">
+      <div class="f-panel-title">Параметры ремонтного подразделения</div>
+      <div class="f-form-grid">
+        <div><label class="f-fld-label" for="ruSpecialists">Количество специалистов, чел.</label>
+          <input id="ruSpecialists" class="f-input" type="number" min="0" step="1" value="${r.specialists}"></div>
+        <div><label class="f-fld-label" for="ruWorkDays">Рабочих дней в месяце</label>
+          <input id="ruWorkDays" class="f-input" type="number" min="1" max="31" step="1" value="${r.workDaysMonth}"></div>
+        <div><label class="f-fld-label" for="ruHoursDay">Продолжительность рабочего дня, ч</label>
+          <input id="ruHoursDay" class="f-input" type="number" min="1" max="24" step="0.5" value="${r.hoursPerDay}"></div>
+        <div><label class="f-fld-label" for="ruNonProd">Вынужденные потери, % от годового фонда</label>
+          <input id="ruNonProd" class="f-input" type="number" min="0" max="100" step="1" value="${r.nonProdPct}"></div>
+      </div>
+    </div>
+    <div class="f-panel">
+      <div class="f-panel-title">Расчётный фонд рабочего времени</div>
+      <div class="f-info-grid">
+        <div><div class="f-info-k">Фонд одного специалиста в месяц</div><div class="f-info-v">${fmtNum(fund.monthlyPerSpecialist, 0)} чел.-ч</div></div>
+        <div><div class="f-info-k">Фонд одного специалиста в год</div><div class="f-info-v">${fmtNum(fund.annualPerSpecialist, 0)} чел.-ч</div></div>
+        <div><div class="f-info-k">Фонд подразделения в месяц</div><div class="f-info-v">${fmtNum(fund.monthlyTotal, 0)} чел.-ч</div></div>
+        <div><div class="f-info-k">Фонд подразделения в год</div><div class="f-info-v">${fmtNum(fund.annualTotal, 0)} чел.-ч</div></div>
+      </div>
+    </div>`;
+}
+
+function renderPlanEconomy() {
+  const from = ui.econ.from;
+  const to   = ui.econ.to;
+  const e = economicsSummary(from, to);
+  const s = DB.settings;
+  return `
+    <div class="f-panel">
+      <div class="f-panel-title">Стоимость нормочаса</div>
+      <div class="f-form-grid">
+        <div><label class="f-fld-label" for="econCost">Стоимость нормочаса, ₽</label>
+          <input id="econCost" class="f-input" type="number" min="0" step="1" value="${s.normHourCost}"></div>
+        <div><label class="f-fld-label" for="econFrom">Период с</label>
+          <input id="econFrom" class="f-input" type="date" value="${esc(from)}"></div>
+        <div><label class="f-fld-label" for="econTo">Период по</label>
+          <input id="econTo" class="f-input" type="date" value="${esc(to)}"></div>
+      </div>
+    </div>
+    <div class="f-panel">
+      <div class="f-panel-title">Экономическая эффективность ТО и ремонта</div>
+      <div class="f-hint" style="margin-bottom:12px">Э<sub>ф</sub> = Т<sub>рт</sub> · С<sub>нч</sub> — трудоёмкость выполненных работ × стоимость нормочаса.</div>
+      <div class="f-info-grid">
+        <div><div class="f-info-k">Выполнено работ (ТО-1/ТО-2/ТР)</div><div class="f-info-v">${e.records}</div></div>
+        <div><div class="f-info-k">Суммарная трудоёмкость</div><div class="f-info-v">${fmtNum(e.totalHours, 0)} чел.-ч</div></div>
+        <div><div class="f-info-k">Экономический эффект</div><div class="f-info-v">${fmtMoney(e.ef)}</div></div>
+      </div>
+      <div class="f-table-wrap" style="margin-top:14px"><div class="f-table-scroll">
+        <table class="f-table">
+          <thead><tr><th>Вид работ</th><th class="f-td-num">Количество</th><th class="f-td-num">Трудоёмкость, чел.-ч</th></tr></thead>
+          <tbody>
+            ${LABOR_KINDS.map(k => `<tr><td>${esc(k)}</td><td class="f-td-num">${e.byKind[k].count}</td><td class="f-td-num">${fmtNum(e.byKind[k].hours, 0)}</td></tr>`).join('')}
+          </tbody>
+        </table>
+      </div></div>
+    </div>
+    <div class="f-panel">
+      <div class="f-panel-title">Загрузка производственных возможностей</div>
+      <div class="f-hint" style="margin-bottom:12px">З<sub>пв</sub> = Т / (Ф<sub>мес</sub>·К) · 100% — за расчётный период учтено ${e.monthsCount} ${plural(e.monthsCount, 'месяц', 'месяца', 'месяцев')} работы подразделения (${fmtNum(e.fund.specialists,0)} чел., фонд ${fmtNum(e.periodFund,0)} чел.-ч).</div>
+      <div class="f-info-grid">
+        <div><div class="f-info-k">Загрузка мощностей</div><div class="f-info-v" style="color:${e.loadPct != null && e.loadPct > 100 ? 'var(--st-overdue)' : 'var(--text-primary)'}">${e.loadPct != null ? e.loadPct.toFixed(1) + '%' : '—'}</div></div>
+      </div>
+    </div>`;
+}
+
+function bindPlanningInputs() {
+  const num = (id, apply) => {
+    const n = el(id);
+    if (!n) return;
+    n.addEventListener('change', () => {
+      const v = parseFloat(String(n.value).replace(',', '.'));
+      if (isNaN(v) || v < 0) { renderView(); return; }
+      apply(v);
+      saveDB();
+      toast('success', 'Параметр сохранён', '');
+      refreshPlanTab();
+    });
+  };
+  num('ruSpecialists', v => DB.settings.repairUnit.specialists = v);
+  num('ruWorkDays',    v => DB.settings.repairUnit.workDaysMonth = v);
+  num('ruHoursDay',    v => DB.settings.repairUnit.hoursPerDay = v);
+  num('ruNonProd',     v => DB.settings.repairUnit.nonProdPct = v);
+  num('econCost',      v => DB.settings.normHourCost = v);
+  num('perTO1',        v => DB.settings.periodTO1 = v);
+  num('perTO2',        v => DB.settings.periodTO2 = v);
+  num('perTR',         v => DB.settings.periodTR = v);
+  num('laborTO1',      v => DB.settings.laborNorms['ТО-1'] = v);
+  num('laborTO2',      v => DB.settings.laborNorms['ТО-2'] = v);
+  num('laborTR',       v => DB.settings.laborNorms['ТР'] = v);
+
+  document.querySelectorAll('[data-ktg-group]').forEach(n => {
+    n.addEventListener('change', () => {
+      const v = parseFloat(String(n.value).replace(',', '.'));
+      if (isNaN(v) || v <= 0 || v >= 1) { renderView(); return; }
+      DB.settings.ktgByGroup[n.dataset.ktgGroup] = v;
+      saveDB();
+      toast('success', 'Норматив КТГ сохранён', '');
+      refreshPlanTab();
+    });
+  });
+
+  const econDate = (id, prop) => {
+    const n = el(id);
+    if (!n) return;
+    n.addEventListener('change', () => {
+      ui.econ = ui.econ || { from: '', to: '' };
+      ui.econ[prop] = n.value;
+      refreshPlanTab();
+    });
+  };
+  econDate('econFrom', 'from');
+  econDate('econTo', 'to');
+}
+
+/* =========================================================================
+   17c. РАЗДЕЛ «ДОКУМЕНТЫ»
+   -------------------------------------------------------------------------
+   Формирование печатных документов по методике планирования эксплуатации
+   и ремонта ВВСТ (ВАМТО, 2025): годовой план, план-график ТО на месяц и
+   типовые акты. Печать — через системный диалог браузера (как и отчёты),
+   разметка использует те же классы .p-title/.p-sub/.p-meta/.p-foot.
+   ========================================================================= */
+
+function printCustom(title, subtitle, bodyHtml, footHtml) {
+  const now = new Date();
+  const stamp = fmtDate(todayISO()) + ' ' +
+    String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+
+  document.getElementById('fleetPrint').innerHTML = `
+    <div class="p-title">${esc(title)}</div>
+    <div class="p-sub">${esc(subtitle)}</div>
+    <div class="p-meta">Дата формирования: ${esc(stamp)}</div>
+    ${bodyHtml}
+    <div class="p-foot">${footHtml || '<span>Исполнитель: _______________________</span><span>«____» _______________ 20____ г.</span>'}</div>`;
+
+  toast('success', 'Готово к печати', 'В диалоге печати выберите «Сохранить как PDF».');
+  setTimeout(() => window.print(), 260);
+}
+
+/* --- F. Годовой план эксплуатации и ремонта --- */
+function printAnnualPlan() {
+  const rows = toNeedByGroup();
+  if (!rows.length) {
+    toast('warning', 'Нет данных', 'Укажите плановую годовую наработку в карточках техники (вкладка «Планирование эксплуатации»).');
+    return;
+  }
+  const totalT = rows.reduce((s, r) => s + r.tTotal, 0);
+  const body = `<table>
+    <thead><tr><th>Марка</th><th>Группа эксплуатации</th><th class="p-num">Единиц</th>
+    <th class="p-num">Годовая наработка, мото·ч</th><th class="p-num">ТО-1</th><th class="p-num">ТО-2</th>
+    <th class="p-num">ТР</th><th class="p-num">Трудозатраты, чел.-ч</th></tr></thead>
+    <tbody>
+      ${rows.map(r => `<tr><td>${esc(r.brand)}</td><td>${esc(r.group)}</td><td class="p-num">${r.count}</td>
+        <td class="p-num">${fmtNum(r.Lgod, 0)}</td><td class="p-num">${r.nTO1}</td><td class="p-num">${r.nTO2}</td>
+        <td class="p-num">${r.nTR}</td><td class="p-num">${fmtNum(r.tTotal, 0)}</td></tr>`).join('')}
+      <tr><td colspan="7"><b>Итого трудозатрат на год</b></td><td class="p-num"><b>${fmtNum(totalT, 0)}</b></td></tr>
+    </tbody></table>`;
+  printCustom('ГОДОВОЙ ПЛАН ЭКСПЛУАТАЦИИ И РЕМОНТА ТЕХНИЧЕСКИХ СРЕДСТВ ТЫЛА',
+    `на ${new Date().getFullYear() + 1} год · рассчитано по методике планирования эксплуатации и ремонта ВВСТ`, body);
+}
+
+/* --- F. План-график ТО на месяц (формула 18: Дто = (Lто-1 − Lф)/Lсс) --- */
+function monthPlanRows() {
+  const s = DB.settings;
+  return DB.vehicles.filter(v => v.status !== 'Списано').map(v => {
+    const st = computeStatus(v);
+    const periodTO1 = (v.interval && v.interval.byHours && v.interval.hours) ? Number(v.interval.hours) : Number(s.periodTO1);
+    const Lf = st.hoursSince;
+    const dailyRun = Number(v.annualPlanHours || 0) > 0 ? Number(v.annualPlanHours) / 365 : null;
+    let daysLeft = null, plannedDate = null;
+    if (dailyRun && dailyRun > 0) {
+      daysLeft = Math.round((periodTO1 - Lf) / dailyRun);
+      plannedDate = addDays(todayISO(), Math.max(0, daysLeft));
+    }
+    return { v, periodTO1, Lf, dailyRun, daysLeft, plannedDate };
+  }).sort((a, b) => (a.daysLeft == null ? Infinity : a.daysLeft) - (b.daysLeft == null ? Infinity : b.daysLeft));
+}
+
+function renderMonthPlanTable(rows) {
+  return `
+    <div class="f-table-wrap"><div class="f-table-scroll">
+      <table class="f-table">
+        <thead><tr>
+          <th>Техника</th><th class="f-td-num">Периодичность ТО-1</th><th class="f-td-num">Наработка с ТО</th>
+          <th class="f-td-num">Среднесуточный пробег</th><th class="f-td-num">Дней до ТО</th><th>Расчётная дата ТО</th>
+        </tr></thead>
+        <tbody>
+          ${rows.map(r => `
+            <tr>
+              <td class="f-td-strong">${esc(r.v.name)}</td>
+              <td class="f-td-num">${fmtNum(r.periodTO1, 0)}</td>
+              <td class="f-td-num">${fmtNum(r.Lf, 0)}</td>
+              <td class="f-td-num">${r.dailyRun != null ? fmtNum(r.dailyRun, 1) : '—'}</td>
+              <td class="f-td-num" style="${r.daysLeft != null && r.daysLeft <= 0 ? 'color:var(--st-overdue);font-weight:600' : ''}">${r.daysLeft != null ? r.daysLeft : '—'}</td>
+              <td>${r.plannedDate ? fmtDate(r.plannedDate) : '<span class="f-td-muted">нет плановой наработки</span>'}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div></div>`;
+}
+
+function printMonthPlan() {
+  const rows = monthPlanRows();
+  const body = `<table>
+    <thead><tr><th>Техника</th><th class="p-num">Периодичность ТО-1</th><th class="p-num">Наработка с ТО</th>
+    <th class="p-num">Среднесут. пробег</th><th class="p-num">Дней до ТО</th><th>Расчётная дата ТО</th></tr></thead>
+    <tbody>${rows.map(r => `<tr><td>${esc(r.v.name)}</td><td class="p-num">${fmtNum(r.periodTO1,0)}</td>
+      <td class="p-num">${fmtNum(r.Lf,0)}</td><td class="p-num">${r.dailyRun != null ? fmtNum(r.dailyRun,1) : '—'}</td>
+      <td class="p-num">${r.daysLeft != null ? r.daysLeft : '—'}</td><td>${r.plannedDate ? fmtDate(r.plannedDate) : '—'}</td></tr>`).join('')}
+    </tbody></table>`;
+  printCustom('ПЛАН-ГРАФИК ТЕХНИЧЕСКОГО ОБСЛУЖИВАНИЯ И РЕМОНТА',
+    `на ${fmtDate(todayISO())}, расчёт по среднесуточному пробегу`, body);
+}
+
+/* --- G. Акты --- */
+function printActWriteoff() {
+  const rows = resourceSummary().filter(r => r.normSet && r.exceeded);
+  const body = rows.length ? `<table>
+    <thead><tr><th>Техника</th><th>Группа</th><th class="p-num">Годовая норма</th>
+    <th class="p-num">Разрешено (за вычетом 5%)</th><th class="p-num">Израсходовано</th><th class="p-num">Перерасход</th></tr></thead>
+    <tbody>${rows.map(r => `<tr><td>${esc(r.v.name)}</td><td>${esc(r.v.expGroup || '—')}</td>
+      <td class="p-num">${fmtNum(r.norm,0)}</td><td class="p-num">${fmtNum(r.allowed,0)}</td>
+      <td class="p-num">${fmtNum(r.used,0)}</td><td class="p-num">${fmtNum(r.used - r.allowed,0)}</td></tr>`).join('')}
+    </tbody></table>` : `<p>Техники с перерасходом годовой нормы моторесурса не выявлено.</p>`;
+  printCustom('АКТ',
+    'о списании моторесурса, израсходованного сверх годовой нормы',
+    body + `<p style="margin-top:14pt">Комиссия в составе: председатель — _____________________________, члены комиссии — _____________________________, _____________________________, рассмотрев данные учёта моторесурса, составила настоящий акт.</p>`,
+    `<span>Председатель комиссии: _______________________</span><span>«____» _______________ 20____ г.</span>`);
+}
+
+function printActInspection() {
+  const rows = DB.vehicles.filter(v => v.status !== 'Списано');
+  const body = `<table>
+    <thead><tr><th style="width:26pt">№</th><th>Техника</th><th>Гос. номер</th><th>Подразделение</th>
+    <th class="p-num">Моточасы</th><th>Статус по учёту</th><th>В наличии (отметка)</th></tr></thead>
+    <tbody>${rows.map((v, i) => `<tr><td>${i + 1}</td><td>${esc(v.name)}</td><td>${esc(v.regNumber || '—')}</td>
+      <td>${esc(v.unit || '—')}</td><td class="p-num">${fmtNum(v.currentHours,0)}</td><td>${esc(v.status)}</td><td></td></tr>`).join('')}
+    </tbody></table>`;
+  printCustom('АКТ', 'внезапной проверки наличия технических средств тыла', body,
+    `<span>Проверку провёл: _______________________</span><span>«____» _______________ 20____ г.</span>`);
+}
+
+function printActUsage(from, to) {
+  const map = new Map();
+  DB.trips.filter(t => (!from || t.date >= from) && (!to || t.date <= to)).forEach(t => {
+    if (!map.has(t.vehicleId)) map.set(t.vehicleId, { trips: 0, run: 0 });
+    const r = map.get(t.vehicleId);
+    r.trips++;
+    r.run += Number(t.endHours || 0) - Number(t.startHours || 0);
+  });
+  const rows = DB.vehicles.filter(v => map.has(v.id));
+  const body = rows.length ? `<table>
+    <thead><tr><th>Техника</th><th class="p-num">Выходов за период</th><th class="p-num">Наработка, мото·ч</th>
+    <th class="p-num">Расход ГСМ по норме</th><th class="p-num">Расход ГСМ фактически</th></tr></thead>
+    <tbody>${rows.map(v => `<tr><td>${esc(v.name)}</td><td class="p-num">${map.get(v.id).trips}</td>
+      <td class="p-num">${fmtNum(map.get(v.id).run,0)}</td><td class="p-num"></td><td class="p-num"></td></tr>`).join('')}
+    </tbody></table>` : `<p>За выбранный период путевые листы не найдены.</p>`;
+  printCustom('АКТ', `проверки использования техники и расхода ГСМ за период с ${fmtDate(from)} по ${fmtDate(to)}`,
+    body + `<p style="margin-top:10pt;font-size:9pt">Графы «Расход ГСМ» заполняются вручную — учёт горюче-смазочных материалов программой не ведётся.</p>`,
+    `<span>Председатель комиссии: _______________________</span><span>«____» _______________ 20____ г.</span>`);
+}
+
+function renderDocuments() {
+  const monthRows = monthPlanRows();
+  return `
+    <div class="f-page-head">
+      <div>
+        <div class="f-page-title">Документы</div>
+        <div class="f-page-sub">Печатные формы по методике планирования эксплуатации и ремонта ВВСТ (ВАМТО, 2025)</div>
+      </div>
+    </div>
+
+    <div class="f-panel">
+      <div class="f-panel-title">Годовой план эксплуатации и ремонта</div>
+      <p class="f-hint">Формируется на основе плановой годовой наработки и нормативов из раздела «Планирование → Потребность в ТО».</p>
+      <button type="button" class="f-btn f-btn-primary" data-act="print-annual-plan">${FI.pdf(15)}<span>Сформировать и распечатать</span></button>
+    </div>
+
+    <div class="f-panel">
+      <div class="f-panel-title">План-график технического обслуживания и ремонта на месяц</div>
+      <p class="f-hint">Расчётная дата очередного ТО-1 — по формуле Д<sub>ТО</sub> = (L<sub>ТО-1</sub> − L<sub>ф</sub>)/L<sub>сс</sub>, где L<sub>сс</sub> — среднесуточный пробег (плановая годовая наработка / 365).</p>
+      ${renderMonthPlanTable(monthRows)}
+      <div style="margin-top:12px">
+        <button type="button" class="f-btn f-btn-primary" data-act="print-month-plan">${FI.pdf(15)}<span>Сформировать и распечатать</span></button>
+      </div>
+    </div>
+
+    <div class="f-panel">
+      <div class="f-panel-title">Акты</div>
+      <div class="f-form-grid" style="margin-bottom:12px">
+        <div><label class="f-fld-label" for="actFrom">Период с</label>
+          <input id="actFrom" class="f-input" type="date" value="${esc(ui.docs.actFrom)}"></div>
+        <div><label class="f-fld-label" for="actTo">Период по</label>
+          <input id="actTo" class="f-input" type="date" value="${esc(ui.docs.actTo)}"></div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button type="button" class="f-btn" data-act="print-act-writeoff">${FI.pdf(15)}<span>Акт списания моторесурса</span></button>
+        <button type="button" class="f-btn" data-act="print-act-inspection">${FI.pdf(15)}<span>Акт внезапной проверки наличия техники</span></button>
+        <button type="button" class="f-btn" data-act="print-act-usage">${FI.pdf(15)}<span>Акт проверки использования техники и расхода ГСМ</span></button>
+      </div>
+    </div>`;
+}
+
+function bindDocuments() {
+  const bind = (id, prop) => {
+    const n = el(id);
+    if (n) n.addEventListener('change', () => { ui.docs[prop] = n.value; });
+  };
+  bind('actFrom', 'actFrom');
+  bind('actTo', 'actTo');
+}
+
+/* =========================================================================
    18. ОТЧЁТЫ
    -------------------------------------------------------------------------
    Единый реестр: описание колонок + функция строк. Из него формируются
@@ -7457,6 +8332,7 @@ const REPORTS = [
       { key: 'serialNumber', label: 'Зав. №', width: 15 },
       { key: 'unit', label: 'Подразделение', width: 20 },
       { key: 'responsible', label: 'Ответственный', width: 22 },
+      { key: 'expGroup', label: 'Группа эксплуатации', width: 18 },
       { key: 'year', label: 'Год выпуска', width: 11, num: true },
       { key: 'regDate', label: 'Дата учёта', width: 13 },
       { key: 'status', label: 'Статус', width: 16 },
@@ -7471,7 +8347,7 @@ const REPORTS = [
         return {
           name: v.name, brand: v.brand, regNumber: v.regNumber, invNumber: v.invNumber,
           serialNumber: v.serialNumber, unit: v.unit, responsible: v.responsible,
-          year: v.year ? Number(v.year) : '', regDate: fmtDate(v.regDate), status: v.status,
+          expGroup: v.expGroup || '', year: v.year ? Number(v.year) : '', regDate: fmtDate(v.regDate), status: v.status,
           hours: Number(v.currentHours || 0), level: levelText(st.level),
           next: st.nextDate ? fmtDate(st.nextDate) : (st.nextHours != null ? fmtNum(st.nextHours, 0) + ' мото·ч' : '—'),
           note: v.note
@@ -7628,6 +8504,70 @@ const REPORTS = [
           updated: v.hoursUpdatedAt ? fmtDate(v.hoursUpdatedAt) : '—'
         };
       }).sort((a, b) => b.current - a.current);
+    }
+  },
+  {
+    key: 'trips', title: 'Путевые листы', file: 'putevye_listy', sheet: 'Путевые листы',
+    desc: 'Журнал ежедневных выходов техники с показаниями счётчика.',
+    icon: FI.route, supportsRange: true,
+    columns: [
+      { key: 'date', label: 'Дата', width: 12 },
+      { key: 'vehicle', label: 'Техника', width: 32 },
+      { key: 'regNumber', label: 'Гос. номер', width: 14 },
+      { key: 'driver', label: 'Водитель', width: 24 },
+      { key: 'purpose', label: 'Маршрут / задача', width: 34 },
+      { key: 'start', label: 'Показание на начало', width: 18, num: true },
+      { key: 'end', label: 'Показание на конец', width: 18, num: true },
+      { key: 'run', label: 'Наработка за выход', width: 17, num: true },
+      { key: 'note', label: 'Примечание', width: 24 }
+    ],
+    rows() {
+      const f = ui.report;
+      return DB.trips
+        .filter(t => (!f.from || t.date >= f.from) && (!f.to || t.date <= f.to))
+        .sort((a, b) => (b.date || '').localeCompare(a.date || ''))
+        .map(t => {
+          const v = getVehicle(t.vehicleId);
+          return {
+            date: fmtDate(t.date), vehicle: v ? v.name : '—', regNumber: v ? v.regNumber : '',
+            driver: t.driver, purpose: t.purpose,
+            start: Number(t.startHours || 0), end: Number(t.endHours || 0),
+            run: Number(t.endHours || 0) - Number(t.startHours || 0), note: t.note
+          };
+        });
+    }
+  },
+  {
+    key: 'tripsMonthly', title: 'Карточка учёта работы машины', file: 'kartochka_ucheta_raboty', sheet: 'Учёт работы машин',
+    desc: 'Помесячная сводка наработки и количества выходов по каждой единице техники (по путевым листам).',
+    icon: FI.gauge, supportsRange: true, supportsUnit: true,
+    columns: [
+      { key: 'month', label: 'Месяц', width: 10 },
+      { key: 'vehicle', label: 'Техника', width: 32 },
+      { key: 'regNumber', label: 'Гос. номер', width: 14 },
+      { key: 'unit', label: 'Подразделение', width: 20 },
+      { key: 'trips', label: 'Количество выходов', width: 16, num: true },
+      { key: 'run', label: 'Наработка за месяц, мото·ч', width: 20, num: true }
+    ],
+    rows() {
+      const f = ui.report;
+      const map = new Map();
+      DB.trips
+        .filter(t => (!f.from || t.date >= f.from) && (!f.to || t.date <= f.to))
+        .forEach(t => {
+          const v = getVehicle(t.vehicleId);
+          if (f.unit && (!v || v.unit !== f.unit)) return;
+          const month = (t.date || '').slice(0, 7);
+          const key = month + '|' + t.vehicleId;
+          if (!map.has(key)) map.set(key, {
+            month, vehicle: v ? v.name : '—', regNumber: v ? v.regNumber : '',
+            unit: v ? v.unit : '', trips: 0, run: 0
+          });
+          const r = map.get(key);
+          r.trips++;
+          r.run += Number(t.endHours || 0) - Number(t.startHours || 0);
+        });
+      return Array.from(map.values()).sort((a, b) => b.month.localeCompare(a.month) || a.vehicle.localeCompare(b.vehicle, 'ru'));
     }
   }
 ];
@@ -7804,6 +8744,7 @@ function vehicleModal(vehicle) {
     name: '', brand: '', regNumber: '', invNumber: '', serialNumber: '',
     unit: '', responsible: '', year: '', regDate: todayISO(),
     status: 'В эксплуатации', note: '', currentHours: 0,
+    expGroup: '', annualPlanHours: '', annualNormHours: '',
     interval: { byHours: true, hours: DB.settings.defaultHours, byDate: true, days: DB.settings.defaultDays }
   };
   const iv = v.interval || {};
@@ -7848,6 +8789,21 @@ function vehicleModal(vehicle) {
           <input id="vHours" class="f-input" type="number" min="0" step="0.1" value="${Number(v.currentHours || 0)}">
           <div class="f-hint">${isNew ? 'Будет создана первая запись в истории моточасов' : 'Изменение добавит запись в историю'}</div>
           <div class="f-error" id="errHours">Моточасы не могут быть отрицательными</div></div>
+
+        <fieldset class="f-fieldset f-span2">
+          <legend>Планирование эксплуатации (методика ВАМТО, 2025)</legend>
+          <div class="f-form-grid">
+            <div><label class="f-fld-label" for="vExpGroup">Группа эксплуатации</label>
+              <select id="vExpGroup" class="f-select">${options(EXP_GROUPS, v.expGroup, 'Не указана')}</select>
+              <div class="f-hint">Определяет норматив КТГ и годовые нормы расхода ресурса</div></div>
+            <div><label class="f-fld-label" for="vAnnualPlan">Плановая годовая наработка, мото·ч</label>
+              <input id="vAnnualPlan" class="f-input" type="number" min="0" step="1" value="${esc(v.annualPlanHours)}">
+              <div class="f-hint">Для расчёта потребности в ТО и трудозатрат на год</div></div>
+            <div><label class="f-fld-label" for="vAnnualNorm">Годовая норма расхода ресурса, мото·ч</label>
+              <input id="vAnnualNorm" class="f-input" type="number" min="0" step="1" value="${esc(v.annualNormHours)}">
+              <div class="f-hint">Лимит на год (приказ Росгвардии); используется в расчёте наличия моторесурса</div></div>
+          </div>
+        </fieldset>
 
         <fieldset class="f-fieldset f-span2">
           <legend>Планирование следующего ТО</legend>
@@ -7918,6 +8874,9 @@ function vehicleModal(vehicle) {
       regDate:      q('vRegDate').value || todayISO(),
       status:       q('vStatus').value,
       note:         q('vNote').value.trim(),
+      expGroup:     q('vExpGroup').value,
+      annualPlanHours: (() => { const n = parseFloat(q('vAnnualPlan').value); return (q('vAnnualPlan').value !== '' && !isNaN(n) && n >= 0) ? n : ''; })(),
+      annualNormHours: (() => { const n = parseFloat(q('vAnnualNorm').value); return (q('vAnnualNorm').value !== '' && !isNaN(n) && n >= 0) ? n : ''; })(),
       interval: {
         byHours, hours: Math.max(1, parseInt(q('vHoursInt').value, 10) || DB.settings.defaultHours),
         byDate,  days:  Math.max(1, parseInt(q('vDaysInt').value, 10)  || DB.settings.defaultDays)
@@ -8539,6 +9498,13 @@ function onFleetClick(e) {
       refreshVehicleTab();
       break;
 
+    case 'plantab':
+      ui.planTab = node.dataset.tab;
+      document.querySelectorAll('.f-tab').forEach(t => t.classList.toggle('is-active', t === node));
+      refreshPlanTab();
+      bindPlanningInputs();
+      break;
+
     case 'add-maint':  maintModal(id); break;
     case 'edit-maint': {
       const m = DB.maint.find(x => x.id === id);
@@ -8553,11 +9519,30 @@ function onFleetClick(e) {
       break;
     }
 
+    case 'add-trip':  tripModal(null); break;
+    case 'edit-trip': {
+      const t = DB.trips.find(x => x.id === id);
+      if (t) tripModal(t);
+      break;
+    }
+    case 'del-trip': {
+      const t = DB.trips.find(x => x.id === id);
+      if (!t) break;
+      confirmDialog('Удалить путевой лист?', `${fmtDate(t.date)}. Действие необратимо.`)
+        .then(ok => { if (!ok) return; removeTrip(t); toast('success', 'Путевой лист удалён', ''); rerender(); });
+      break;
+    }
+    case 'reset-trips':
+      Object.assign(ui.trips, { vehicle: '', from: '', to: '' });
+      renderView();
+      break;
+
     case 'add-hours': hoursModal(id); break;
     case 'del-hours': {
       const h = DB.hours.find(x => x.id === id);
       if (!h) break;
       if (h.maintId) { toast('warning', 'Запись связана с ТО', 'Удалите соответствующую запись технического обслуживания.'); break; }
+      if (h.tripId)  { toast('warning', 'Запись связана с путевым листом', 'Удалите соответствующий путевой лист.'); break; }
       confirmDialog('Удалить показание моточасов?', `${fmtDate(h.date)} — ${fmtNum(h.value, 0)} мото·ч`)
         .then(ok => {
           if (!ok) return;
@@ -8650,6 +9635,12 @@ function onFleetClick(e) {
       break;
     case 'export-xlsx': exportXlsx(getReport(ui.report.key)); break;
     case 'export-pdf':  exportPdf(getReport(ui.report.key)); break;
+
+    case 'print-annual-plan':  printAnnualPlan(); break;
+    case 'print-month-plan':   printMonthPlan(); break;
+    case 'print-act-writeoff':   printActWriteoff(); break;
+    case 'print-act-inspection': printActInspection(); break;
+    case 'print-act-usage':      printActUsage(ui.docs.actFrom, ui.docs.actTo); break;
 
     case 'apply-intervals': {
       const s = DB.settings;
