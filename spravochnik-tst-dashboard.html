@@ -1187,6 +1187,13 @@ body[data-ws="catalog"] #fleetBell         { display: none !important; }
 .f-ring-cap { font-size: 10.5px; color: var(--text-secondary); margin-top: 3px; max-width: 92px; }
 
 /* ---------- Карточки техники (плиточный вид) ---------- */
+/* В плитке кольцо компактнее, чем в карточке техники: иначе на колонку
+   с данными остаётся ~120 px и строка «метка + дата» (нужно ~163 px)
+   разрывается переносом */
+.f-vcard .f-ring-wrap { width: 88px; height: 88px; }
+.f-vcard .f-ring-pct  { font-size: 20px; }
+.f-vcard .f-ring-cap  { max-width: 74px; font-size: 10px; }
+
 .f-cards {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
@@ -1223,9 +1230,16 @@ body[data-ws="catalog"] #fleetBell         { display: none !important; }
 .f-vcard-model { font-size: 12.5px; color: var(--text-secondary); margin-top: 2px; }
 .f-vcard-body { display: flex; align-items: center; gap: 14px; margin-top: 14px; }
 .f-vcard-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
-.f-kv { display: flex; justify-content: space-between; gap: 8px; font-size: 12.5px; }
-.f-kv-k { color: var(--text-secondary); }
-.f-kv-v { font-weight: 550; text-align: right; font-variant-numeric: tabular-nums; }
+/* Колонка данных в карточке узкая (≈120 px). Без flex-wrap и min-width: 0
+   длинные значения (например, наименование подразделения) не сжимаются,
+   выходят за карточку и обрезаются её overflow: hidden — поэтому значение
+   переносится на свою строку и разбивается по словам. */
+.f-kv { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 6px; font-size: 12.5px; }
+.f-kv-k { color: var(--text-secondary); flex: 0 0 auto; }
+.f-kv-v {
+  font-weight: 550; text-align: right; font-variant-numeric: tabular-nums;
+  min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere;
+}
 .f-plate {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px; font-weight: 600;
@@ -1507,6 +1521,9 @@ body[data-ws="catalog"] #fleetBell         { display: none !important; }
 @media (max-width: 480px) {
   .f-navbar { padding: 8px 12px; }
   .f-scroll { padding: 16px 12px 52px; }
+  /* На узком экране уведомления занимают почти всю ширину: сверху они
+     закрывали заголовок раздела и кнопки действий — переносим их вниз */
+  .f-toasts { top: auto; bottom: 12px; left: 12px; right: 12px; max-width: none; }
   .f-panel, .f-hero { padding: 15px; }
   .f-modal-body { padding: 16px; }
   .f-modal-head { padding: 16px 16px 12px; }
@@ -7071,7 +7088,7 @@ function renderParkResults(rows) {
         <div class="f-vcard-body">
           ${resourceRing(st)}
           <div class="f-vcard-meta">
-            <div class="f-kv"><span class="f-kv-k">Подразделение</span><span class="f-kv-v">${esc(v.unit || '—')}</span></div>
+            <div class="f-kv"><span class="f-kv-k">Подразделение</span><span class="f-kv-v" title="${esc(v.unit || '')}">${esc(v.unit || '—')}</span></div>
             <div class="f-kv"><span class="f-kv-k">Моточасы</span><span class="f-kv-v">${fmtNum(v.currentHours, 0)}</span></div>
             <div class="f-kv"><span class="f-kv-k">Последнее ТО</span><span class="f-kv-v">${fmtDate(st.lastMaint && st.lastMaint.date)}</span></div>
             <div class="f-kv"><span class="f-kv-k">Следующее ТО</span><span class="f-kv-v">${st.nextDate ? fmtDate(st.nextDate) : (st.nextHours != null ? fmtNum(st.nextHours, 0) + ' м·ч' : '—')}</span></div>
